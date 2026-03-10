@@ -24,9 +24,9 @@ v14 is a complete, working key-value server. v15 is what happens when you engine
 ## Repository Layout
 
 ```
-redis/
-├── 14/                         # v14 — first-generation server (poll-based)
-│   ├── 14_server.cpp           # main server: poll() event loop
+KernelKV/
+├── core/                       # base server — poll-based, in-memory
+│   ├── server.cpp              # main server: poll() event loop
 │   ├── hashtable.h / .cpp      # progressive-rehash hash map
 │   ├── avl.h / .cpp            # AVL tree (used by ZSet)
 │   ├── zset.h / .cpp           # sorted set: AVL + HMap dual index
@@ -35,19 +35,27 @@ redis/
 │   ├── list.h                  # intrusive doubly-linked list
 │   └── common.h                # container_of, FNV hash (str_hash)
 │
-├── 15/                         # v15 — new server (all features)
-│   ├── 15_server.cpp           # main server: ET event loop + WAL + mmap + MT-GET
+├── engine/                     # full server — all features enabled
+│   ├── server.cpp              # main server: ET event loop + WAL + mmap + MT-GET
 │   ├── event_loop.h / .cpp     # kqueue (macOS) / epoll (Linux) abstraction
 │   ├── wal.h / .cpp            # Write-Ahead Log: CRC-32 + fdatasync
 │   ├── mmap_store.h / .cpp     # mmap + ftruncate append-only snapshot
 │   └── rcu.h / .cpp            # seqlock RCU for concurrent reads
+│
+├── stages/                     # incremental build-up (TCP → hash map → ZSet → TTL)
+│   ├── 03/                     # basic TCP echo server
+│   ├── 04/                     # request/response framing
+│   ├── 06/ – 09/               # protocol parsing, multi-client, hash map
+│   ├── 10/                     # AVL tree
+│   ├── 11/ – 12/               # sorted set + linked list queries
+│   └── 13/                     # heap + TTL expiry
 │
 ├── bench/
 │   ├── bench.cpp               # benchmark: p50/p99/p999 + GPU correlation
 │   ├── gpu_profiler.h          # GPU profiler interface
 │   └── gpu_profiler.cpp        # NVML sampling + latency correlation CSV
 │
-├── Makefile                    # builds server14, server15, bench
+├── Makefile                    # builds kvs-base, kvs, bench
 └── README.md                   # this file
 ```
 
@@ -184,12 +192,12 @@ Event loop                  Thread pool workers         Wakeup pipe
 ### Build
 
 ```bash
-# Build everything (server14, server15, bench — CPU-only GPU profiler)
+# Build everything (kvs-base, kvs, bench — CPU-only GPU profiler)
 make all
 
 # Build individual targets
-make server14
-make server15
+make kvs-base
+make kvs
 make bench
 
 # Build bench with NVML GPU support (requires nvidia-ml on Linux)
@@ -202,11 +210,11 @@ make clean
 ### Run servers
 
 ```bash
-# Run v14 (poll-based, in-memory only)
-./server14
+# Run base server (poll-based, in-memory only)
+./kvs-base
 
-# Run v15 (kqueue/epoll + WAL + mmap + seqlock RCU + MT-GET)
-./server15
+# Run full engine (kqueue/epoll + WAL + mmap + seqlock RCU + MT-GET)
+./kvs
 
 # v15 startup output:
 #   restored N keys from snapshot + WAL
@@ -243,16 +251,16 @@ wait
 
 ```bash
 # Terminal 1: start server
-./server15
+./kvs
 
 # Terminal 2: run benchmark (seeds data via WAL + mmap)
 ./bench/bench 127.0.0.1 1234 100000 16
 
 # Terminal 1: kill mid-run with Ctrl-C or kill -9 <pid>
-kill -9 $(pgrep server15)
+kill -9 $(pgrep kvs)
 
 # Terminal 1: restart — observe WAL replay
-./server15
+./kvs
 # Output: restored N keys from snapshot + WAL
 #         listening on :1234  (kqueue/epoll + WAL + mmap + MT-GET)
 ```
@@ -262,8 +270,8 @@ WAL records are replayed in order with CRC-32 verification. Any partially-writte
 ### Makefile convenience targets
 
 ```bash
-make run14        # build + run server14
-make run15        # build + run server15
+make run-base     # build + run kvs-base
+make run          # build + run kvs
 make run-bench    # build + run bench with defaults (127.0.0.1:1234, 100000 ops, pipeline=16)
 ```
 
@@ -273,7 +281,7 @@ make run-bench    # build + run bench with defaults (127.0.0.1:1234, 100000 ops,
 
 All results on Apple Silicon MacBook (macOS 25.0, clang++ with `-O2`). Server and bench on the same machine (loopback). No GPU present — GPU profiler runs in CPU-only mode.
 
-### Pipeline depth scaling (server15, 100 000 ops)
+### Pipeline depth scaling (kvs, 100 000 ops)
 
 | Pipeline | Throughput | p50 latency | p99 latency | p99.9 latency |
 |---|---|---|---|---|
@@ -283,20 +291,20 @@ All results on Apple Silicon MacBook (macOS 25.0, clang++ with `-O2`). Server an
 
 **Interpretation:** Pipeline=64 gives 5× the throughput of pipeline=1. Per-batch latency rises proportionally, but per-request amortised latency falls.
 
-### server14 vs server15 comparison (100 000 ops)
+### kvs-base vs kvs comparison (100 000 ops)
 
 | Server | Pipeline | Throughput | p50 | p99 | Notes |
 |---|---|---|---|---|---|
-| server14 | 1 | 70,822 ops/s | 14 µs | 48 µs | Inline GET, poll-based |
-| server15 | 1 | 44,064 ops/s | 30 µs | 53 µs | MT-GET dispatch overhead |
-| server14 | 16 | 415,341 ops/s | 40 µs | 99 µs | Inline GET, no thread overhead |
-| server15 | 16 | 114,262 ops/s | 384 µs | 546 µs | Thread pool bottleneck |
+| kvs-base | 1 | 70,822 ops/s | 14 µs | 48 µs | Inline GET, poll-based |
+| kvs      | 1 | 44,064 ops/s | 30 µs | 53 µs | MT-GET dispatch overhead |
+| kvs-base | 16 | 415,341 ops/s | 40 µs | 99 µs | Inline GET, no thread overhead |
+| kvs      | 16 | 114,262 ops/s | 384 µs | 546 µs | Thread pool bottleneck |
 
-**Why server15 is slower for GET-only:** MT-GET was designed for *write-heavy* workloads with concurrent writers, where the seqlock reader retry loop lets GETs proceed while SETs run. In a GET-only benchmark with no concurrent writers, the thread-pool round-trip (dispatch → worker → wakeup pipe → drain_results) adds ~300 µs of overhead vs. inline processing.
+**Why `kvs` is slower for GET-only:** MT-GET was designed for *write-heavy* workloads with concurrent writers, where the seqlock reader retry loop lets GETs proceed while SETs run. In a GET-only benchmark with no concurrent writers, the thread-pool round-trip (dispatch → worker → wakeup pipe → drain_results) adds ~300 µs of overhead vs. inline processing.
 
-**Where server15 wins:** Under mixed workloads with concurrent writers, server14 would stall all reads while executing a SET (single-threaded). server15 allows readers to run concurrently via seqlock, recovering that latency.
+**Where `kvs` wins:** Under mixed workloads with concurrent writers, `kvs-base` would stall all reads while executing a SET (single-threaded). `kvs` allows readers to run concurrently via seqlock, recovering that latency.
 
-### Concurrent connections (server15, 5 000 ops each, pipeline=16)
+### Concurrent connections (kvs, 5 000 ops each, pipeline=16)
 
 | Connections | Throughput each | p50 | p99 |
 |---|---|---|---|
@@ -408,14 +416,14 @@ The WAL is fully implemented. To demonstrate:
 
 ```bash
 # Seed data
-./server15 &
+./kvs &
 ./bench/bench 127.0.0.1 1234 50000 16
 
 # Kill mid-run
-kill -9 $(pgrep server15)
+kill -9 $(pgrep kvs)
 
 # Restart and observe replay
-./server15
+./kvs
 # Expected: "restored N keys from snapshot + WAL"
 ```
 
@@ -478,7 +486,7 @@ void wal_flush(WAL *wal) { fdatasync(wal->fd); }
 | Observability | None | p50/p99/p999 + GPU correlation CSV |
 | Commands | SET / GET / DEL / ZADD / etc. | Same + WAL-logged + snapshot-backed |
 
-**Throughput headroom:** At pipeline=64, server15 reaches 220k ops/s on a single loopback connection on a laptop. On a server-class machine with real network, the kqueue/epoll model eliminates the O(N) poll bottleneck and scales cleanly to thousands of connections.
+**Throughput headroom:** At pipeline=64, `kvs` reaches 220k ops/s on a single loopback connection on a laptop. On a server-class machine with real network, the kqueue/epoll model eliminates the O(N) poll bottleneck and scales cleanly to thousands of connections.
 
 ---
 
@@ -511,13 +519,13 @@ sudo apt install nvidia-cuda-toolkit
 make all
 
 # 2. Start server
-./server15
+./kvs
 
 # 3. In another terminal — run benchmark
 ./bench/bench 127.0.0.1 1234 100000 16
 
 # 4. Stop server (Ctrl-C), restart — see WAL replay
-./server15
+./kvs
 ```
 
 Expected server startup output:

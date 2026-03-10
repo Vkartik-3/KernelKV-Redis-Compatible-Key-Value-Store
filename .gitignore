@@ -2,8 +2,8 @@
 .claude/
 
 # Build outputs
-server14
-server15
+kvs-base
+kvs
 bench/bench
 
 # Persistence files generated at runtime

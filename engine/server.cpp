@@ -18,13 +18,13 @@
 #include <vector>
 #include <atomic>
 #include <deque>
-// proj (unchanged modules reused from 14/)
-#include "../14/common.h"
-#include "../14/hashtable.h"
-#include "../14/zset.h"
-#include "../14/list.h"
-#include "../14/heap.h"
-#include "../14/thread_pool.h"
+// proj — shared core modules
+#include "../core/common.h"
+#include "../core/hashtable.h"
+#include "../core/zset.h"
+#include "../core/list.h"
+#include "../core/heap.h"
+#include "../core/thread_pool.h"
 // new modules
 #include "event_loop.h"
 #include "wal.h"
