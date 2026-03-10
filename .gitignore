@@ -1,0 +1,18 @@
+# Claude Code internals
+.claude/
+
+# Build outputs
+server14
+server15
+bench/bench
+
+# Persistence files generated at runtime
+redis.dat
+redis.wal
+
+# macOS noise
+.DS_Store
+
+# Editor scratch files
+*.o
+*.d
