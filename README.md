@@ -177,7 +177,7 @@ Event loop                  Thread pool workers         Wakeup pipe
 | I/O multiplexing | **kqueue** (macOS) / **epoll** (Linux) | edge-triggered (`EV_CLEAR` / `EPOLLET`) |
 | Threading | **pthreads** | 4-thread pool + mutex + condvar |
 | Persistence | **mmap(MAP_SHARED)** + **ftruncate()** | 4 MB growth quanta, `msync(MS_ASYNC)` on write |
-| Durability | **fdatasync()** (Linux) / **fsync()** (macOS) | called on every WAL write |
+| Durability | **fdatasync()** (Linux) / **fsync()** (macOS) | group commit: one fsync per pipeline batch, before responses are acked |
 | Integrity | **CRC-32** (ISO 3309 / Ethernet poly `0xEDB88320`) | rolled by hand, no external library |
 | Hash function | **FNV-1** (`str_hash` in common.h) | 64-bit, from-scratch |
 | GPU monitoring | **NVML** (`libnvidia-ml`) | optional, graceful fallback when absent |
@@ -226,16 +226,19 @@ Both servers listen on **port 1234** by default.
 ### Benchmark
 
 ```bash
-# Usage: ./bench/bench [host] [port] [ops] [pipeline]
+# Usage: ./bench/bench [host] [port] [ops] [pipeline] [mode]
 ./bench/bench 127.0.0.1 1234 100000 16
 
-# Defaults: host=127.0.0.1  port=1234  ops=100000  pipeline=16
+# Defaults: host=127.0.0.1  port=1234  ops=100000  pipeline=16  mode=get
 
 # Quick sanity check (fast)
 ./bench/bench 127.0.0.1 1234 5000 1
 
 # High-throughput pipeline sweep
 ./bench/bench 127.0.0.1 1234 100000 64
+
+# Mixed 80/20 GET/SET workload
+./bench/bench 127.0.0.1 1234 100000 64 mixed:80
 
 # With GPU profiling enabled (NVIDIA host only)
 make bench GPU=1
@@ -273,43 +276,88 @@ WAL records are replayed in order with CRC-32 verification. Any partially-writte
 make run-base     # build + run kvs-base
 make run          # build + run kvs
 make run-bench    # build + run bench with defaults (127.0.0.1:1234, 100000 ops, pipeline=16)
+make test         # build + run the full test suite (unit + integration)
+```
+
+---
+
+## Testing
+
+`make test` builds and runs the whole suite; CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs it on every push and PR across Linux (g++) and macOS (clang++). Any failed assertion exits nonzero and fails the build.
+
+| Suite | File | Covers |
+|---|---|---|
+| Hash table | [`tests/test_hashtable.cpp`](tests/test_hashtable.cpp) | insert / lookup / delete / size; 5 000-key progressive-rehash stress |
+| Sorted set | [`tests/test_zset.cpp`](tests/test_zset.cpp) | insert, score update, delete, `seekge` ordering, `znode_offset` arithmetic |
+| Write-ahead log | [`tests/test_wal.cpp`](tests/test_wal.cpp) | append/sync group commit, replay, **CRC-mismatch truncation**, **partial-tail recovery**, checkpoint |
+| Integration | [`tests/test_integration.py`](tests/test_integration.py) | drives the real `kvs` server over TCP — string/zset/expire commands, type errors, 200-deep pipelined GET, and **`SIGKILL` crash recovery (100/100 keys replayed)** |
+
+The WAL and crash-recovery tests directly guard the durability contract behind [WAL group commit](#optimization-2--wal-group-commit-the-write-path-unlock): a mutation is acked only after `fdatasync`, and a killed server replays every acked write. The pipelined-GET test guards the [inline-GET fast-path](#optimization-1--inline-get-fast-path-the-throughput-unlock).
+
+```bash
+make test
+# ── tests/test_hashtable ──   PASSED: 5013 checks, 0 failed
+# ── tests/test_zset ──        PASSED: 21 checks, 0 failed
+# ── tests/test_wal ──         PASSED: 16 checks, 0 failed
+# ── tests/test_integration ── PASSED: 19 checks, 0 failed
 ```
 
 ---
 
 ## Benchmark Results
 
-All results on Apple Silicon MacBook (macOS 25.0, clang++ with `-O2`). Server and bench on the same machine (loopback). No GPU present — GPU profiler runs in CPU-only mode.
+All results on Apple Silicon MacBook (macOS 25.0, clang++ with `-O2`). Server and bench on the **same machine over a single loopback TCP connection** — this is single-connection loopback throughput, not networked or multi-client throughput. No GPU present — GPU profiler runs in CPU-only mode.
 
-### Pipeline depth scaling (kvs, 100 000 ops)
+**Methodology:** Each figure is the **median of 7 runs** of 100 000 ops; min/max shown to bound run-to-run variance. GET-only throughput (the `qps` field) is measured over the GET pass; mixed throughput is measured over the whole interleaved stream. Latency percentiles are per-batch. Raw run logs are committed under [`bench/results/`](bench/results/) so every number here is reproducible from saved output, not reconstructed.
 
-| Pipeline | Throughput | p50 latency | p99 latency | p99.9 latency |
-|---|---|---|---|---|
-| 1 | 44,064 ops/s | 30 µs | 53 µs | 121 µs |
-| 16 | 114,262 ops/s | 384 µs | 546 µs | 6,239 µs |
-| 64 | 220,792 ops/s | 1,338 µs | 1,651 µs | 2,085 µs |
+### Pipeline depth scaling (kvs, 100 000 ops, GET-only, single loopback connection)
 
-**Interpretation:** Pipeline=64 gives 5× the throughput of pipeline=1. Per-batch latency rises proportionally, but per-request amortised latency falls.
-
-### kvs-base vs kvs comparison (100 000 ops)
-
-| Server | Pipeline | Throughput | p50 | p99 | Notes |
+| Pipeline | Throughput (median of 7) | min–max | p50 | p99 | p99.9 |
 |---|---|---|---|---|---|
-| kvs-base | 1 | 70,822 ops/s | 14 µs | 48 µs | Inline GET, poll-based |
-| kvs      | 1 | 44,064 ops/s | 30 µs | 53 µs | MT-GET dispatch overhead |
-| kvs-base | 16 | 415,341 ops/s | 40 µs | 99 µs | Inline GET, no thread overhead |
-| kvs      | 16 | 114,262 ops/s | 384 µs | 546 µs | Thread pool bottleneck |
+| 1 | 70,031 ops/s | 69,240–70,365 | 31 µs | 53 µs | 124 µs |
+| 16 | 443,685 ops/s | 390,999–445,911 | 135 µs | 242 µs | 656 µs |
+| 64 | 836,183 ops/s | 760,688–837,563 | 367 µs | 537 µs | 3,605 µs |
 
-**Why `kvs` is slower for GET-only:** MT-GET was designed for *write-heavy* workloads with concurrent writers, where the seqlock reader retry loop lets GETs proceed while SETs run. In a GET-only benchmark with no concurrent writers, the thread-pool round-trip (dispatch → worker → wakeup pipe → drain_results) adds ~300 µs of overhead vs. inline processing.
+**Interpretation:** Pipelining is the dominant throughput lever — depth 16 gives ~6.3× over depth 1 by amortising the per-request syscall round-trip; depth 64 adds another ~1.9×. Throughput keeps climbing with depth because reads now execute inline on the event-loop thread (see optimization #1 below), so a pipelined batch drains in a single pass with no per-request dispatch.
 
-**Where `kvs` wins:** Under mixed workloads with concurrent writers, `kvs-base` would stall all reads while executing a SET (single-threaded). `kvs` allows readers to run concurrently via seqlock, recovering that latency.
+### Optimization #1 — inline GET fast-path (the throughput unlock)
+
+The original `kvs` dispatched **every** GET to the thread pool and *suspended the connection* until a worker posted the result (`dispatch_get` → `worker_get_func` → `wakeup_pipe` → `drain_results`). On a pipelined connection that serialises the pipeline to **one read in flight at a time** — the round-trip dominates and deep pipelines buy nothing. `try_one_request` now executes GET **inline under the same seqlock read section** the worker used, so the whole pipeline batch drains in one pass. (`dispatch_get`/`worker_get_func` are retained for the offload path and WAL replay.)
+
+| pipeline=64 GET-only | Before (dispatch) | After (inline) | Speedup |
+|---|---|---|---|
+| Throughput (median of 7) | 129,997 ops/s | **836,183 ops/s** | **6.4×** |
+
+Correctness is unchanged: the inline read uses the same `rcu_read_begin` / `rcu_read_retry` seqlock protocol against the single-threaded writer. Raw logs: [`bench/results/pipeline64_get_optimized.csv`](bench/results/pipeline64_get_optimized.csv) (before: [`pipeline64_get.csv`](bench/results/pipeline64_get.csv)).
+
+### Optimization #2 — WAL group commit (the write-path unlock)
+
+The original WAL called `fdatasync()` on **every** mutation. Under a mixed workload the per-write fsync dominates. `wal_write` is now split into `wal_append` (buffer the record, no fsync) + `wal_sync` (one `fdatasync` per pipeline batch), called once in `handle_read` **before any response is flushed** — so a write is still acked only after it is durable. Same durability contract, ~13× fewer fsyncs per pipeline=64 batch.
+
+Crash-recovery verified: 50 acked SETs → `kill -9` → restart → **50/50 keys recovered** via WAL replay (CRC-checked, partial-tail truncation intact).
+
+### Mixed 80/20 read/write workload (kvs, 100 000 ops, pipeline=64, single loopback connection)
+
+Interleaved GET/SET on one pipelined connection at an 80% read / 20% write ratio, measured over the **whole mixed stream** (includes WAL append + group-commit fsync on the 20% writes). The op sequence uses a fixed seed (`srand(12345)`) so the ratio and stream are reproducible run-to-run.
+
+| Workload | Before (dispatch + per-write fsync) | After (inline GET + group commit) | Speedup |
+|---|---|---|---|
+| 80% GET / 20% SET | 117,063 ops/s | **396,336 ops/s** | **3.4×** |
+
+After-state spread: median 396,336, min 385,043, max 403,367 (median of 7); p50 157 µs, p99 ~290 µs. Actual split ~79,900 GET / ~20,100 SET. Run as:
+
+```bash
+./bench/bench 127.0.0.1 1234 100000 64 mixed:80
+```
+
+Raw logs: [`bench/results/mixed_80_20_optimized.csv`](bench/results/mixed_80_20_optimized.csv) (before: [`mixed_80_20.csv`](bench/results/mixed_80_20.csv)).
 
 ### Concurrent connections (kvs, 5 000 ops each, pipeline=16)
 
 | Connections | Throughput each | p50 | p99 |
 |---|---|---|---|
-| 1 | 88,385 ops/s | 398 µs | 732 µs |
-| 2 | 88,717 ops/s (conn1), 88,385 ops/s (conn2) | ~678 µs | ~1.2 ms |
+| 1 | 514,456 ops/s | 189 µs | 570 µs |
+| 2 | 506,637 ops/s (conn1), 494,609 ops/s (conn2) | ~223 µs | ~447 µs |
 
 Two concurrent clients with separate connections each achieve near-identical throughput, confirming the accept-loop fix and per-connection ordering invariants work correctly.
 
@@ -427,16 +475,12 @@ kill -9 $(pgrep kvs)
 # Expected: "restored N keys from snapshot + WAL"
 ```
 
-### 2. Mixed workload benchmark (code change needed)
+### 2. Mixed workload benchmark — **implemented**
 
-Current `bench.cpp` runs a pure SET pass followed by a pure GET pass. A true 80%/20% GET/SET mixed benchmark requires interleaving commands in `run_bench`. Estimated change: ~20 lines.
+`bench.cpp` now supports an interleaved GET/SET mode (`run_bench_mixed`) at a configurable read ratio, in addition to the original SET-then-GET pass. See the [Mixed 80/20 read/write workload](#mixed-8020-readwrite-workload-kvs-100-000-ops-pipeline64-single-loopback-connection) results above.
 
-```cpp
-// Sketch of mixed pass:
-if (rand() % 10 < 8)
-    write_all(fd, get_req.data(), get_req.size());
-else
-    write_all(fd, set_req.data(), set_req.size());
+```bash
+./bench/bench 127.0.0.1 1234 100000 64 mixed:80   # 80% GET / 20% SET
 ```
 
 ### 3. Large connection-count sweep (100 / 500 / 1000 conns)
@@ -459,14 +503,9 @@ Build with `make bench GPU=1` and run on a Linux machine with an NVIDIA GPU. The
 timestamp_ms,ops_in_window,gpu_util_pct,mem_used_mb,power_watts,p99_us_in_window
 ```
 
-### 5. WAL group commit (performance optimization)
+### 5. WAL group commit — **implemented**
 
-Currently `fdatasync()` is called on every single write. For high write throughput, batching multiple WAL records and calling `fdatasync()` once per group can reduce write latency by 10×. Implementation sketch:
-
-```cpp
-// wal.cpp: buffer N records, fsync once
-void wal_flush(WAL *wal) { fdatasync(wal->fd); }
-```
+`fdatasync()` was previously called on every single write. It is now batched: `wal_append` buffers records and `wal_sync` issues one `fdatasync` per pipeline batch (in `handle_read`, before any response is flushed). This lifted the 80/20 mixed workload from 117k → **396k ops/s** with the same durability contract. See [Optimization #2](#optimization-2--wal-group-commit-the-write-path-unlock).
 
 ### 6. Seqlock RCU — `std::string` copy safety
 
@@ -486,7 +525,7 @@ void wal_flush(WAL *wal) { fdatasync(wal->fd); }
 | Observability | None | p50/p99/p999 + GPU correlation CSV |
 | Commands | SET / GET / DEL / ZADD / etc. | Same + WAL-logged + snapshot-backed |
 
-**Throughput headroom:** At pipeline=64, `kvs` reaches 220k ops/s on a single loopback connection on a laptop. On a server-class machine with real network, the kqueue/epoll model eliminates the O(N) poll bottleneck and scales cleanly to thousands of connections.
+**Throughput headroom:** At pipeline=64, `kvs` reaches ~836k GET ops/s (and ~396k ops/s under an 80/20 mixed workload) on a single loopback connection on a laptop — median of 7 runs, see [Benchmark Results](#benchmark-results). These are single-connection loopback figures, not networked throughput; they rose 6.4× / 3.4× after the inline-GET and WAL group-commit optimizations. On a server-class machine with real network and many connections, the kqueue/epoll model eliminates the O(N) poll bottleneck and scales across connections rather than relying on deeper pipelining of one connection.
 
 ---
 
@@ -537,7 +576,7 @@ listening on :1234  (kqueue/epoll + WAL + mmap + MT-GET)
 Expected bench output:
 ```
 ops,pipeline,total_ms,qps,p50_us,p99_us,p999_us
-100000,16,875.2,114262,384,546,6239
+100000,16,225.4,443685,135,242,656
 timestamp_ms,ops_in_window,gpu_util_pct,mem_used_mb,power_watts,p99_us_in_window
 ...
 ```

@@ -37,13 +37,22 @@ using WALReplayFn =
 struct WAL {
     int      fd        = -1;
     uint64_t file_size = 0;
+    bool     dirty     = false;  // unsynced records pending fdatasync()
 };
 
 // Open or create the WAL at `path`.  Existing records are replayed via
 // `replay_fn` (pass nullptr to skip replay).
 void wal_open(WAL *wal, const char *path, WALReplayFn replay_fn);
 
-// Append one record and call fdatasync() before returning.
+// Append one record WITHOUT fsync (marks the WAL dirty). Use with wal_sync()
+// for group commit: append every record in a pipeline batch, then sync once.
+void wal_append(WAL *wal, WALOp op, const std::vector<std::string> &args);
+
+// fdatasync() the WAL if there are unsynced records; no-op otherwise.
+// After this returns, every preceding wal_append() is durable on disk.
+void wal_sync(WAL *wal);
+
+// Append one record and fdatasync() immediately (= wal_append + wal_sync).
 void wal_write(WAL *wal, WALOp op, const std::vector<std::string> &args);
 
 // Truncate the WAL to zero (call after a successful mmap checkpoint).

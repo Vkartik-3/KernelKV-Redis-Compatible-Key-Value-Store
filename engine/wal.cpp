@@ -120,7 +120,7 @@ void wal_open(WAL *wal, const char *path, WALReplayFn replay_fn) {
     lseek(wal->fd, (off_t)wal->file_size, SEEK_SET);
 }
 
-void wal_write(WAL *wal, WALOp op, const std::vector<std::string> &args) {
+void wal_append(WAL *wal, WALOp op, const std::vector<std::string> &args) {
     // Serialize payload: [op:1][nargs:4][arg_len:4][arg]...
     std::vector<uint8_t> payload;
     payload.push_back((uint8_t)op);
@@ -144,14 +144,24 @@ void wal_write(WAL *wal, WALOp op, const std::vector<std::string> &args) {
     write_all(wal->fd, hdr,            8);
     write_all(wal->fd, payload.data(), payload_len);
 
-    // Guarantee durability: data reaches stable storage before we return.
-    // fdatasync() skips updating atime/mtime metadata — faster than fsync().
+    wal->file_size += 8 + payload_len;
+    wal->dirty      = true;   // not durable until wal_sync()
+}
+
+void wal_sync(WAL *wal) {
+    if (!wal->dirty) return;
+    // Group commit: one fdatasync() makes every appended record since the last
+    // sync durable. fdatasync() skips atime/mtime metadata — faster than fsync().
     if (fdatasync(wal->fd) != 0) {
-        perror("wal_write: fdatasync()");
+        perror("wal_sync: fdatasync()");
         abort();
     }
+    wal->dirty = false;
+}
 
-    wal->file_size += 8 + payload_len;
+void wal_write(WAL *wal, WALOp op, const std::vector<std::string> &args) {
+    wal_append(wal, op, args);
+    wal_sync(wal);
 }
 
 void wal_checkpoint(WAL *wal) {

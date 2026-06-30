@@ -1,13 +1,15 @@
 // Redis-clone benchmark — measures latency and throughput.
 //
 // Usage:
-//   ./bench [host] [port] [ops] [pipeline]
+//   ./bench [host] [port] [ops] [pipeline] [mode]
 //
 // Defaults:
 //   host     = 127.0.0.1
 //   port     = 1234
 //   ops      = 100000
 //   pipeline = 16   (requests in-flight before reading responses)
+//   mode     = get  (SET-then-GET pass; qps from GET pass)
+//              "mixed" or "mixed:80" => interleaved GET/SET at READ_PCT% reads
 //
 // Output (to stdout):
 //   CSV header + one row of results:
@@ -231,6 +233,83 @@ static void run_bench(int fd, int total_ops, int pipeline,
     fprintf(stderr, "────────────────────────────────────────────────────────\n");
 }
 
+// ── Mixed workload benchmark (weighted random GET/SET) ────────────────────────
+//
+// Interleaves GET and SET on a single pipelined connection at a fixed ratio.
+// `read_pct` is the percentage of operations that are GETs (e.g. 80 => 80/20).
+// Throughput is measured over the WHOLE mixed stream (not a separate pass), so
+// the qps reflects the real cost of mixing writes (WAL + fsync) into reads.
+//
+// The op sequence is generated with a fixed seed so the GET/SET ratio is stable
+// and the benchmark is reproducible run-to-run.
+static void run_bench_mixed(int fd, int total_ops, int pipeline, int read_pct,
+                            std::vector<uint64_t> *out_latency_us,
+                            uint64_t              *out_bench_start_ms) {
+    Histogram hist;
+
+    auto get_req = encode_request({"get", "bench_key"});
+    auto set_req = encode_request({"set", "bench_key", "bench_val_xxxxxxxxxxxxxxxx"});
+
+    // Seed one SET so the key exists before the read-heavy stream starts.
+    write_all(fd, set_req.data(), set_req.size());
+    skip_response(fd);
+
+    // Pre-generate the op plan (true = GET, false = SET) with a fixed seed.
+    srand(12345);
+    std::vector<bool> is_get(total_ops);
+    int n_get = 0, n_set = 0;
+    for (int i = 0; i < total_ops; i++) {
+        bool g = (rand() % 100) < read_pct;
+        is_get[i] = g;
+        if (g) n_get++; else n_set++;
+    }
+
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        *out_bench_start_ms = (uint64_t)ts.tv_sec * 1000u
+                            + (uint64_t)ts.tv_nsec / 1000000u;
+    }
+
+    uint64_t thr_start = now_us();
+
+    int sent = 0, recvd = 0;
+    while (recvd < total_ops) {
+        uint64_t b0 = now_us();
+        int batch = 0;
+        while (sent < total_ops && batch < pipeline) {
+            if (is_get[sent]) write_all(fd, get_req.data(), get_req.size());
+            else              write_all(fd, set_req.data(), set_req.size());
+            sent++; batch++;
+        }
+        for (int i = 0; i < batch; i++) { skip_response(fd); recvd++; }
+        uint64_t e = now_us() - b0;
+        hist.record(e);
+        out_latency_us->push_back(e);
+    }
+
+    uint64_t thr_us = now_us() - thr_start;
+    double   thr_ms = (double)thr_us / 1000.0;
+    double   qps    = (double)total_ops / ((double)thr_us / 1e6);
+
+    printf("ops,pipeline,read_pct,total_ms,qps,p50_us,p99_us,p999_us\n");
+    printf("%d,%d,%d,%.1f,%.0f,%llu,%llu,%llu\n",
+           total_ops, pipeline, read_pct, thr_ms, qps,
+           (unsigned long long)hist.percentile(0.50),
+           (unsigned long long)hist.percentile(0.99),
+           (unsigned long long)hist.percentile(0.999));
+
+    fprintf(stderr, "\n── Mixed Workload Results ──────────────────────────────\n");
+    fprintf(stderr, "  ops          : %d total (%d GET / %d SET, target %d%% read)\n",
+            total_ops, n_get, n_set, read_pct);
+    fprintf(stderr, "  pipeline     : %d\n", pipeline);
+    fprintf(stderr, "  throughput   : %.0f ops/s\n", qps);
+    fprintf(stderr, "  latency p50  : %llu µs\n", (unsigned long long)hist.percentile(0.50));
+    fprintf(stderr, "  latency p99  : %llu µs\n", (unsigned long long)hist.percentile(0.99));
+    fprintf(stderr, "  latency p99.9: %llu µs\n", (unsigned long long)hist.percentile(0.999));
+    fprintf(stderr, "────────────────────────────────────────────────────────\n");
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char **argv) {
@@ -238,13 +317,25 @@ int main(int argc, char **argv) {
     int         port    = (argc>2) ? atoi(argv[2]) : 1234;
     int         ops     = (argc>3) ? atoi(argv[3]) : 100000;
     int         pipeln  = (argc>4) ? atoi(argv[4]) : 16;
+    // mode: "get" (default — SET-then-GET pass, qps from GET pass)
+    //       "mixed[:READ_PCT]" — interleaved GET/SET, qps over whole stream.
+    const char *mode    = (argc>5) ? argv[5] : "get";
 
     if (ops    < 1)    ops    = 100000;
     if (pipeln < 1)    pipeln = 1;
     if (pipeln > 1024) pipeln = 1024;
 
-    fprintf(stderr, "connecting to %s:%d  ops=%d  pipeline=%d\n",
-            host, port, ops, pipeln);
+    bool mixed    = (strncmp(mode, "mixed", 5) == 0);
+    int  read_pct = 80;
+    if (mixed) {
+        const char *colon = strchr(mode, ':');
+        if (colon) read_pct = atoi(colon + 1);
+        if (read_pct < 0)   read_pct = 0;
+        if (read_pct > 100) read_pct = 100;
+    }
+
+    fprintf(stderr, "connecting to %s:%d  ops=%d  pipeline=%d  mode=%s\n",
+            host, port, ops, pipeln, mixed ? "mixed" : "get");
 
     int fd = tcp_connect(host, port);
     fprintf(stderr, "connected\n");
@@ -257,7 +348,10 @@ int main(int argc, char **argv) {
     std::vector<uint64_t> latency_timeline;
     uint64_t              bench_start_ms = 0;
 
-    run_bench(fd, ops, pipeln, &latency_timeline, &bench_start_ms);
+    if (mixed)
+        run_bench_mixed(fd, ops, pipeln, read_pct, &latency_timeline, &bench_start_ms);
+    else
+        run_bench(fd, ops, pipeln, &latency_timeline, &bench_start_ms);
 
     gpu_profiler_stop(&gpu);
 
