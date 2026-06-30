@@ -38,6 +38,8 @@ struct WAL {
     int      fd        = -1;
     uint64_t file_size = 0;
     bool     dirty     = false;  // unsynced records pending fdatasync()
+    uint64_t records   = 0;      // total records appended (observability)
+    uint64_t syncs     = 0;      // total fdatasync() calls — group-commit count
 };
 
 // Open or create the WAL at `path`.  Existing records are replayed via

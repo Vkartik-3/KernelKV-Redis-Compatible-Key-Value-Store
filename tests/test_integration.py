@@ -157,6 +157,43 @@ def test_type_error(s):
     check(isinstance(res, tuple) and res[0] == "ERR", "GET on a zset returns an error")
 
 
+def parse_info(text):
+    info = {}
+    for line in text.replace("\r\n", "\n").splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            info[k] = int(v) if v.isdigit() else v
+    return info
+
+
+def test_info(s):
+    info = parse_info(call(s, "info"))
+    for key in ("uptime_seconds", "connections_received", "commands_processed",
+                "reads", "writes", "keyspace_keys",
+                "wal_records", "wal_syncs", "wal_bytes"):
+        check(key in info, f"INFO exposes {key}")
+    check(info.get("commands_processed", 0) > 0, "INFO commands_processed > 0")
+    check(info.get("connections_active", 0) >= 1, "INFO counts the live connection")
+
+
+def test_info_group_commit(s):
+    # A pipelined burst of writes must group-commit: many WAL records, but far
+    # fewer fdatasync() calls. INFO makes that observable.
+    before = parse_info(call(s, "info"))
+    n = 100
+    payload = b"".join(encode("set", f"gc{i}", "v") for i in range(n))
+    s.sendall(payload)
+    for _ in range(n):
+        (ln,) = struct.unpack("<I", _recv_exact(s, 4))
+        _recv_exact(s, ln)
+    after = parse_info(call(s, "info"))
+
+    recs = after["wal_records"] - before["wal_records"]
+    syncs = after["wal_syncs"] - before["wal_syncs"]
+    check(recs >= n, f"INFO records the {n} writes (got {recs})")
+    check(syncs < recs, f"group commit: {syncs} fsyncs < {recs} records")
+
+
 def test_pipeline(s):
     # Inline-GET fast-path: many pipelined GETs must all return correctly.
     call(s, "set", "p", "PVAL")
@@ -203,7 +240,8 @@ def main():
         s = socket.create_connection((HOST, PORT))
         try:
             for t in (test_string_commands, test_overwrite, test_expire,
-                      test_zset, test_type_error, test_pipeline):
+                      test_zset, test_type_error, test_info,
+                      test_info_group_commit, test_pipeline):
                 print(f"  • {t.__name__}")
                 t(s)
         finally:

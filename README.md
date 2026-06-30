@@ -299,8 +299,30 @@ make test
 # ── tests/test_hashtable ──   PASSED: 5013 checks, 0 failed
 # ── tests/test_zset ──        PASSED: 21 checks, 0 failed
 # ── tests/test_wal ──         PASSED: 16 checks, 0 failed
-# ── tests/test_integration ── PASSED: 19 checks, 0 failed
+# ── tests/test_integration ── PASSED: 32 checks, 0 failed
 ```
+
+---
+
+## Observability
+
+The server exposes runtime metrics via an `INFO` command (Redis-style newline-delimited `key:value` text), so throughput, keyspace size, and the write path can be monitored without a debugger or restart. Counters live on the single event-loop thread, so they're race-free and add no locking to the hot path.
+
+```text
+$ redis-style INFO →
+uptime_seconds:42
+connections_received:8
+connections_active:3
+commands_processed:1048576
+reads:838861
+writes:209715
+keyspace_keys:50000
+wal_records:209715
+wal_syncs:16104        ← group commit: ~13× fewer fsyncs than writes
+wal_bytes:5242880
+```
+
+The `wal_records` vs `wal_syncs` pair makes [WAL group commit](#optimization-2--wal-group-commit-the-write-path-unlock) directly observable: under pipelined writes the fsync count stays far below the record count. The integration suite asserts this invariant (`test_info_group_commit`).
 
 ---
 
@@ -404,6 +426,7 @@ Tags: 0=nil  1=err  2=str  3=int  4=dbl  5=arr
 | `zrem <key> <member>` | 3 | int (0/1) |
 | `zscore <key> <member>` | 3 | dbl or nil |
 | `zquery <key> <score> <name> <offset> <limit>` | 6 | arr |
+| `info` | 1 | str (server metrics) |
 
 ---
 

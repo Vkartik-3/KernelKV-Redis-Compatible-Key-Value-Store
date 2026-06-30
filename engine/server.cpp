@@ -188,6 +188,16 @@ static struct {
     int      listen_fd = -1;
     uint64_t mutations_since_ckpt = 0;
 
+    // ── Observability counters ─────────────────────────────────────────────
+    // All commands run on the single event-loop thread, so plain (non-atomic)
+    // counters are race-free. Exposed via the INFO command.
+    uint64_t stat_start_ms       = 0;   // server start (monotonic ms)
+    uint64_t stat_conns_total    = 0;   // connections accepted since start
+    uint64_t stat_conns_active   = 0;   // currently open connections
+    uint64_t stat_commands_total = 0;   // requests processed (live, not replay)
+    uint64_t stat_reads          = 0;   // non-mutating commands
+    uint64_t stat_writes         = 0;   // mutating commands
+
     // ── Multithreaded GET dispatch ─────────────────────────────────────────
     // Worker threads post GetResult* here, then write 1 byte to wakeup_pipe[1].
     // The event loop reads wakeup_pipe[0] and drains result_queue.
@@ -621,8 +631,39 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer &out) {
     out_end_arr(out,ctx,(uint32_t)n);
 }
 
+// INFO — return server metrics as a newline-delimited key:value text blob,
+// mirroring the shape of Redis INFO. Read-only; safe to poll for monitoring.
+static void do_info(Buffer &out) {
+    uint64_t uptime_ms = get_monotonic_msec() - g.stat_start_ms;
+    char buf[768];
+    int n = snprintf(buf, sizeof(buf),
+        "uptime_seconds:%llu\r\n"
+        "connections_received:%llu\r\n"
+        "connections_active:%llu\r\n"
+        "commands_processed:%llu\r\n"
+        "reads:%llu\r\n"
+        "writes:%llu\r\n"
+        "keyspace_keys:%zu\r\n"
+        "wal_records:%llu\r\n"
+        "wal_syncs:%llu\r\n"
+        "wal_bytes:%llu\r\n",
+        (unsigned long long)(uptime_ms / 1000),
+        (unsigned long long)g.stat_conns_total,
+        (unsigned long long)g.stat_conns_active,
+        (unsigned long long)g.stat_commands_total,
+        (unsigned long long)g.stat_reads,
+        (unsigned long long)g.stat_writes,
+        hm_size(&g.db),
+        (unsigned long long)g.wal.records,
+        (unsigned long long)g.wal.syncs,
+        (unsigned long long)g.wal.file_size);
+    if (n < 0) n = 0;
+    out_str(out, buf, (size_t)n);
+}
+
 static void do_request(std::vector<std::string> &cmd, Buffer &out) {
-    if      (cmd.size()==2 && cmd[0]=="get")     do_get(cmd,out);
+    if      (cmd.size()==1 && cmd[0]=="info")    do_info(out);
+    else if (cmd.size()==2 && cmd[0]=="get")     do_get(cmd,out);
     else if (cmd.size()==3 && cmd[0]=="set")     do_set(cmd,out);
     else if (cmd.size()==2 && cmd[0]=="del")     do_del(cmd,out);
     else if (cmd.size()==3 && cmd[0]=="pexpire") do_expire(cmd,out);
@@ -712,6 +753,13 @@ static bool try_one_request(Conn *conn) {
     if (parse_req(&conn->incoming[4], len, cmd) < 0) {
         conn->want_close=true; return false;
     }
+
+    // ── Observability: classify and count the request ─────────────────────
+    g.stat_commands_total++;
+    bool is_write = !cmd.empty() &&
+        (cmd[0]=="set" || cmd[0]=="del" || cmd[0]=="pexpire" ||
+         cmd[0]=="zadd" || cmd[0]=="zrem");
+    if (is_write) g.stat_writes++; else g.stat_reads++;
 
     // ── GET fast-path: execute inline under the seqlock read section ──────
     // Keeps the connection's pipeline flowing (no suspend/wakeup round-trip).
@@ -807,6 +855,8 @@ static void handle_accept(int listen_fd) {
     g.fd2conn[connfd] = conn;
 
     el_add(&g.el, connfd, EV_READ|EV_ERR, (void*)(intptr_t)connfd);
+    g.stat_conns_total++;
+    g.stat_conns_active++;
     } // end while(true) accept loop
 }
 
@@ -826,6 +876,7 @@ static void conn_destroy(Conn *conn) {
     g.fd2conn[conn->fd] = NULL;
     dlist_detach(&conn->idle_node);
     delete conn;
+    if (g.stat_conns_active) g.stat_conns_active--;
 }
 
 
@@ -924,6 +975,7 @@ int main() {
     fd_set_nb(g.wakeup_pipe[1]);   // non-blocking so workers never block on write
 
     // ── Restore state from disk ───────────────────────────────────────────
+    g.stat_start_ms = get_monotonic_msec();
     g.replaying = true;
     mmap_open(&g.mstore, "redis.dat", mmap_replay);
     wal_open(&g.wal, "redis.wal", wal_replay);

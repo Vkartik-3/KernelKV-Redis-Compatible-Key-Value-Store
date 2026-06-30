@@ -146,6 +146,7 @@ void wal_append(WAL *wal, WALOp op, const std::vector<std::string> &args) {
 
     wal->file_size += 8 + payload_len;
     wal->dirty      = true;   // not durable until wal_sync()
+    wal->records++;
 }
 
 void wal_sync(WAL *wal) {
@@ -157,6 +158,7 @@ void wal_sync(WAL *wal) {
         abort();
     }
     wal->dirty = false;
+    wal->syncs++;
 }
 
 void wal_write(WAL *wal, WALOp op, const std::vector<std::string> &args) {
