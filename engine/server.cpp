@@ -20,6 +20,7 @@
 #include <deque>
 #include <map>
 #include <set>
+#include <unordered_set>
 // proj — shared core modules
 #include "../core/common.h"
 #include "../core/hashtable.h"
@@ -132,7 +133,11 @@ struct TxnWrite {
 struct Txn {
     bool                            active  = false;
     uint64_t                        read_ts = 0;
-    std::map<std::string, TxnWrite> writes;   // ordered → deterministic commit
+    std::map<std::string, TxnWrite> writes;     // string keyspace (MVCC)
+    // Non-string mutations (zadd/zrem/pexpire) are buffered as raw commands and
+    // replayed atomically at COMMIT — they get all-or-nothing atomicity, but
+    // not snapshot-isolated reads (sorted sets / TTLs are not versioned).
+    std::vector<std::vector<std::string>> deferred;
 };
 
 struct Conn {
@@ -622,11 +627,17 @@ static void do_begin(Conn *conn, Buffer &out) {
     return out_str(out, "OK", 2);
 }
 
+// Defined below; needed by do_commit to replay buffered non-string mutations.
+static void do_zadd(std::vector<std::string> &cmd, Buffer &out);
+static void do_zrem(std::vector<std::string> &cmd, Buffer &out);
+static void do_expire(std::vector<std::string> &cmd, Buffer &out);
+
 static void txn_end(Conn *conn) {
     auto it = g.active_snaps.find(conn->txn.read_ts);
     if (it != g.active_snaps.end()) g.active_snaps.erase(it);
     conn->txn.active = false;
     conn->txn.writes.clear();
+    conn->txn.deferred.clear();
 }
 
 static void do_rollback(Conn *conn, Buffer &out) {
@@ -653,12 +664,22 @@ static void do_commit(Conn *conn, Buffer &out) {
         }
     }
 
-    // No conflict — apply every buffered write atomically at one commit_ts.
+    // No conflict — apply every buffered string write atomically at one
+    // commit_ts, then replay buffered non-string mutations in order. All run on
+    // the single event-loop thread with no interleaving, and their WAL records
+    // land in the same group-commit batch, so the transaction is atomic.
     uint64_t ct = ++g.clock;
     rcu_write_lock(&g.rcu);
     for (auto &kv : conn->txn.writes)
         apply_write(kv.first, ct, kv.second.deleted, kv.second.value);
     rcu_write_unlock(&g.rcu);
+
+    Buffer scratch;
+    for (auto &cmd : conn->txn.deferred) {
+        if      (cmd[0]=="zadd")    do_zadd(cmd, scratch);
+        else if (cmd[0]=="zrem")    do_zrem(cmd, scratch);
+        else if (cmd[0]=="pexpire") do_expire(cmd, scratch);
+    }
 
     txn_end(conn);
     if (!g.replaying) maybe_checkpoint();
@@ -709,21 +730,59 @@ static void do_ttl(std::vector<std::string> &cmd, Buffer &out) {
     return out_int(out, expire_at > now_ms ? (int64_t)(expire_at-now_ms) : 0);
 }
 
+// Snapshot-consistent KEYS. A string key is visible if the version at the
+// caller's snapshot (read_ts) is non-deleted, with the transaction's own
+// buffered writes overlaid (read-your-own-writes). ZSet keys are shown live.
+struct KeysCtx {
+    Conn                     *conn;
+    uint64_t                  read_ts;
+    std::vector<std::string>  keys;
+    std::unordered_set<std::string> seen;
+};
+
 static bool cb_keys(HNode *node, void *arg) {
-    std::vector<const std::string*> &keys = *(std::vector<const std::string*>*)arg;
-    Entry *ent = container_of(node, Entry, node);
+    KeysCtx *c   = (KeysCtx *)arg;
+    Entry   *ent = container_of(node, Entry, node);
+    c->seen.insert(ent->key);
     if (ent->type == T_STR) {
-        Version *v = mvcc_visible(ent, g.clock);
-        if (!v || v->deleted) return true;     // skip tombstoned keys
+        // Transaction's own buffered write wins (read-your-own-writes).
+        if (c->conn && c->conn->txn.active) {
+            auto it = c->conn->txn.writes.find(ent->key);
+            if (it != c->conn->txn.writes.end()) {
+                if (!it->second.deleted) c->keys.push_back(ent->key);
+                return true;
+            }
+        }
+        Version *v = mvcc_visible(ent, c->read_ts);
+        if (!v || v->deleted) return true;     // not visible at the snapshot
     }
-    keys.push_back(&ent->key);
+    c->keys.push_back(ent->key);
     return true;
 }
-static void do_keys(std::vector<std::string> &, Buffer &out) {
-    std::vector<const std::string*> keys;
-    hm_foreach(&g.db, &cb_keys, &keys);
-    out_arr(out,(uint32_t)keys.size());
-    for (const std::string *k : keys) out_str(out, k->data(), k->size());
+
+static void do_keys(Conn *conn, std::vector<std::string> &, Buffer &out) {
+    KeysCtx c;
+    c.conn    = conn;
+    c.read_ts = (conn && conn->txn.active) ? conn->txn.read_ts : g.clock;
+    hm_foreach(&g.db, &cb_keys, &c);
+    // Add keys created by this transaction that don't exist committed yet.
+    if (conn && conn->txn.active)
+        for (auto &kv : conn->txn.writes)
+            if (!kv.second.deleted && !c.seen.count(kv.first))
+                c.keys.push_back(kv.first);
+    out_arr(out,(uint32_t)c.keys.size());
+    for (const std::string &k : c.keys) out_str(out, k.data(), k.size());
+}
+
+// Inside a transaction, buffer a non-string mutation for atomic replay at
+// COMMIT (returns QUEUED); outside one, run it immediately.
+static void defer_or_run(Conn *conn, std::vector<std::string> &cmd, Buffer &out,
+                         void (*fn)(std::vector<std::string>&, Buffer&)) {
+    if (conn && conn->txn.active) {
+        conn->txn.deferred.push_back(cmd);
+        return out_str(out, "QUEUED", 6);
+    }
+    fn(cmd, out);
 }
 
 static void do_zadd(std::vector<std::string> &cmd, Buffer &out) {
@@ -835,11 +894,14 @@ static void do_request(Conn *conn, std::vector<std::string> &cmd, Buffer &out) {
                                                     else out_err(out,ERR_UNKNOWN,"no connection"); }
     else if (cmd.size()==1 && cmd[0]=="rollback") { if (conn) do_rollback(conn,out);
                                                     else out_err(out,ERR_UNKNOWN,"no connection"); }
-    else if (cmd.size()==3 && cmd[0]=="pexpire")  do_expire(cmd,out);
+    else if (cmd.size()==1 && cmd[0]=="keys")     do_keys(conn,cmd,out);
+    // Non-string mutations buffer into the transaction (atomic at COMMIT);
+    // outside a transaction they apply immediately.
+    else if (cmd.size()==3 && cmd[0]=="pexpire")  defer_or_run(conn,cmd,out,&do_expire);
+    else if (cmd.size()==4 && cmd[0]=="zadd")     defer_or_run(conn,cmd,out,&do_zadd);
+    else if (cmd.size()==3 && cmd[0]=="zrem")     defer_or_run(conn,cmd,out,&do_zrem);
+    // Non-string reads run live (sorted sets / TTLs are not versioned).
     else if (cmd.size()==2 && cmd[0]=="pttl")     do_ttl(cmd,out);
-    else if (cmd.size()==1 && cmd[0]=="keys")     do_keys(cmd,out);
-    else if (cmd.size()==4 && cmd[0]=="zadd")     do_zadd(cmd,out);
-    else if (cmd.size()==3 && cmd[0]=="zrem")     do_zrem(cmd,out);
     else if (cmd.size()==3 && cmd[0]=="zscore")   do_zscore(cmd,out);
     else if (cmd.size()==6 && cmd[0]=="zquery")   do_zquery(cmd,out);
     else out_err(out,ERR_UNKNOWN,"unknown command");

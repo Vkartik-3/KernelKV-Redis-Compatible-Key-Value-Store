@@ -182,6 +182,8 @@ Entry "k"
 - **Write-write conflict detection (first-committer-wins)**: at `COMMIT`, if any key in the write set has a head version newer than the transaction's `read_ts`, the transaction aborts. This prevents lost updates — true snapshot isolation, not just atomic batching.
 - **Garbage collection**: a `std::multiset` tracks the read timestamps of in-flight transactions; on each write the chain is pruned of versions older than the newest one still visible to the oldest live snapshot, bounding chain length.
 - **`DEL` is a tombstone version**, so a concurrent snapshot can still see the pre-delete value; `keys` skips tombstoned entries.
+- **`KEYS` is snapshot-consistent**: inside a transaction it reflects the keys visible at `read_ts` with the transaction's own buffered writes overlaid (new keys added, deleted keys hidden), and does *not* show keys committed after the snapshot.
+- **All command types are transactional**: `ZADD`/`ZREM`/`PEXPIRE` issued inside a transaction are buffered (they return `QUEUED`) and replayed atomically at `COMMIT` in the same WAL group-commit batch, so a mixed transaction is all-or-nothing.
 
 ```text
 A: SET k v0
@@ -198,7 +200,16 @@ A: COMMIT  → OK
 B: COMMIT  → ERR write-write conflict; transaction aborted
 ```
 
-The fast read path stays fast: with no transactions a key has a single version whose `commit_ts <= g.clock`, so the inline-GET path returns the head in O(1) — the common case is unchanged. *Scope:* MVCC versioning covers the string keyspace (`GET`/`SET`/`DEL`); ZSets and TTLs are not versioned, and snapshots do not survive a restart (replay rebuilds the latest committed state). Verified by `test_mvcc` and `test_mvcc_durability` in the integration suite.
+The fast read path stays fast: with no transactions a key has a single version whose `commit_ts <= g.clock`, so the inline-GET path returns the head in O(1) — the common case is unchanged.
+
+**Per-type guarantees (honest scope):**
+
+| | Atomicity at COMMIT | Snapshot-isolated reads | Read-your-own-writes | Write-write conflict detection |
+|---|---|---|---|---|
+| Strings (`GET`/`SET`/`DEL`) | ✅ | ✅ | ✅ | ✅ |
+| Sorted sets / TTL (`ZADD`/`ZREM`/`PEXPIRE`) | ✅ (buffered, replayed at commit) | ❌ reads run live | ❌ | ❌ |
+
+The isolation level is **snapshot isolation**, not serializable — it does not protect against write-skew (no read-set validation / SSI). True snapshot-isolated reads for sorted sets would require versioning the AVL structure (a separate effort). Snapshots do not survive a restart (replay rebuilds the latest committed state). Verified by `test_mvcc` and `test_mvcc_durability` in the integration suite (snapshot isolation, read-your-writes, rollback, write-write conflict, transactional `ZADD`/`DEL`, and snapshot-consistent `KEYS`).
 
 ---
 
@@ -335,7 +346,7 @@ make test
 # ── tests/test_zset ──        PASSED: 21 checks, 0 failed
 # ── tests/test_wal ──         PASSED: 16 checks, 0 failed
 # ── tests/fuzz_parser ──      PASSED: correctness + ~50k fuzz iterations, 0 failed
-# ── tests/test_integration ── PASSED: 51 checks, 0 failed
+# ── tests/test_integration ── PASSED: 62 checks, 0 failed
 ```
 
 ### Fuzzing & input hardening

@@ -9,6 +9,7 @@ tests/fuzz_parser
 tests/fuzz_parser_lf
 tests/*.tmp
 tests/*.dSYM
+tests/__pycache__/
 
 # Persistence files generated at runtime
 redis.dat

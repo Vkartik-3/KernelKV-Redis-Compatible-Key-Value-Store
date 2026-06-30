@@ -152,8 +152,8 @@ def test_zset(s):
 
 
 def test_type_error(s):
-    call(s, "zadd", "zt", "1", "m")
-    res = call(s, "get", "zt")
+    call(s, "zadd", "txz", "1", "m")
+    res = call(s, "get", "txz")
     check(isinstance(res, tuple) and res[0] == "ERR", "GET on a zset returns an error")
 
 
@@ -257,6 +257,40 @@ def test_mvcc(workdir):
         # ── Errors on misuse ──
         check(isinstance(call(a, "commit"), tuple), "COMMIT with no txn errors")
         check(isinstance(call(a, "rollback"), tuple), "ROLLBACK with no txn errors")
+
+        # ── All command types are transactional (atomic at COMMIT) ──
+        call(a, "begin")
+        check(call(a, "set", "s", "sv") is None, "string SET buffered in txn")
+        check(call(a, "zadd", "mvzset", "1", "m") == "QUEUED", "ZADD buffers as QUEUED")
+        check(call(b, "zscore", "mvzset", "m") != 1.0,
+              "other conn does not see uncommitted ZADD")
+        call(a, "commit")
+        check(call(a, "zscore", "mvzset", "m") == 1.0, "buffered ZADD applied atomically")
+        check(call(a, "get", "s") == "sv", "string write committed alongside ZADD")
+
+        # ── ROLLBACK discards buffered non-string writes too ──
+        call(a, "begin")
+        call(a, "zadd", "mvzset", "9", "discarded")
+        call(a, "rollback")
+        check(call(a, "zscore", "mvzset", "discarded") != 9.0,
+              "rolled-back ZADD never applied")
+
+        # ── Snapshot-consistent KEYS ──
+        call(a, "set", "kbase", "x")
+        call(a, "begin")
+        snap = set(call(a, "keys"))
+        check("kbase" in snap, "KEYS shows committed key at snapshot")
+        call(a, "set", "knew", "n")
+        check("knew" in set(call(a, "keys")), "KEYS includes txn's own new key")
+        call(a, "del", "kbase")
+        check("kbase" not in set(call(a, "keys")), "KEYS hides txn's own delete")
+        call(b, "set", "kother", "o")               # committed mid-txn
+        check("kother" not in set(call(a, "keys")),
+              "KEYS does not show keys committed after the snapshot")
+        call(a, "commit")
+        post = set(call(a, "keys"))
+        check("knew" in post and "kbase" not in post and "kother" in post,
+              "KEYS reflects all committed state after COMMIT")
     finally:
         a.close()
         b.close()
