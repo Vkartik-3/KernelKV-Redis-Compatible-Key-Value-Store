@@ -18,6 +18,8 @@
 #include <vector>
 #include <atomic>
 #include <deque>
+#include <map>
+#include <set>
 // proj — shared core modules
 #include "../core/common.h"
 #include "../core/hashtable.h"
@@ -119,6 +121,20 @@ struct GetResult {
 
 // ── Connection ────────────────────────────────────────────────────────────────
 
+// ── MVCC transaction state (per connection) ─────────────────────────────────
+// A transaction reads as of a fixed snapshot (read_ts) and buffers its writes
+// until COMMIT, which applies them atomically at a single new commit timestamp
+// (after a write-write conflict check — snapshot isolation, first-committer-wins).
+struct TxnWrite {
+    bool        deleted = false;   // true = DEL, false = SET
+    std::string value;
+};
+struct Txn {
+    bool                            active  = false;
+    uint64_t                        read_ts = 0;
+    std::map<std::string, TxnWrite> writes;   // ordered → deterministic commit
+};
+
 struct Conn {
     int  fd         = -1;
     bool want_read  = false;
@@ -128,6 +144,7 @@ struct Conn {
     Buffer outgoing;
     uint64_t last_active_ms = 0;
     DList    idle_node;
+    Txn      txn;     // MVCC transaction state (inactive unless BEGIN issued)
     // True while a worker thread holds a GetTask for this fd.
     // conn_destroy() defers actual cleanup until the worker posts its result.
     std::atomic<bool> get_pending{false};
@@ -138,13 +155,25 @@ struct Conn {
 
 enum { T_INIT=0, T_STR=1, T_ZSET=2 };
 
+// ── MVCC version chain ──────────────────────────────────────────────────────
+// Each string key owns a chain of versions, newest first. A read at snapshot
+// timestamp R sees the newest version whose commit_ts <= R. SET prepends a new
+// version; DEL prepends a tombstone. Versions no longer visible to any active
+// snapshot are pruned (see mvcc_prune). ZSets are not versioned (documented).
+struct Version {
+    uint64_t    commit_ts = 0;
+    bool        deleted   = false;
+    std::string value;
+    Version    *next      = nullptr;
+};
+
 struct Entry {
     HNode   node;
     std::string key;
     size_t  heap_idx = (size_t)-1;
     uint32_t type    = 0;
-    std::string str;
-    ZSet    zset;
+    Version *vhead   = nullptr;   // T_STR: version chain (newest first)
+    ZSet    zset;                 // T_ZSET
 };
 
 struct LookupKey { HNode node; std::string key; };
@@ -184,9 +213,60 @@ static struct {
     int             wakeup_pipe[2]  = {-1, -1};
     pthread_mutex_t result_mu;                   // protects result_queue
     std::deque<GetResult *> result_queue;
+
+    // ── MVCC ───────────────────────────────────────────────────────────────
+    uint64_t                 clock = 0;        // last assigned commit timestamp
+    std::multiset<uint64_t>  active_snaps;     // read_ts of in-flight transactions
 } g;
 
 static const uint64_t k_ckpt_ops = 1000;
+
+
+// ── MVCC version-chain helpers ──────────────────────────────────────────────
+
+// Oldest snapshot anyone could still read with; versions older than the newest
+// version visible to it can never be seen again and may be freed.
+static uint64_t mvcc_min_active() {
+    return g.active_snaps.empty() ? g.clock : *g.active_snaps.begin();
+}
+
+// Newest version visible at read_ts (commit_ts <= read_ts), or nullptr.
+static Version *mvcc_visible(const Entry *ent, uint64_t read_ts) {
+    for (Version *v = ent->vhead; v; v = v->next)
+        if (v->commit_ts <= read_ts) return v;
+    return nullptr;
+}
+
+// Free every version older than the newest one visible to the oldest snapshot.
+static void mvcc_prune(Entry *ent) {
+    uint64_t floor = mvcc_min_active();
+    for (Version *v = ent->vhead; v; v = v->next) {
+        if (v->commit_ts <= floor) {
+            Version *old = v->next;
+            v->next = nullptr;
+            while (old) { Version *n = old->next; delete old; old = n; }
+            return;
+        }
+    }
+}
+
+// Prepend a new version (commit_ts must be the latest), then prune.
+static void mvcc_push(Entry *ent, uint64_t commit_ts, bool deleted,
+                      std::string value) {
+    Version *v   = new Version();
+    v->commit_ts = commit_ts;
+    v->deleted   = deleted;
+    v->value     = std::move(value);
+    v->next      = ent->vhead;
+    ent->vhead   = v;
+    mvcc_prune(ent);
+}
+
+static void mvcc_free_chain(Entry *ent) {
+    Version *v = ent->vhead;
+    while (v) { Version *n = v->next; delete v; v = n; }
+    ent->vhead = nullptr;
+}
 
 
 // ── entry_eq — declared here so worker_get_func can use it ───────────────────
@@ -248,10 +328,10 @@ static void worker_get_func(void *arg) {
             if (ent->type != T_STR) {
                 out_err(resp, ERR_BAD_TYP, "not a string value");
             } else {
-                // Copy the value while holding the seqlock read section.
-                // If rcu_read_retry fires, this copy is discarded and we retry.
-                std::string val = ent->str;
-                out_str(resp, val.data(), val.size());
+                // Dead path (live reads are inline now); read latest committed.
+                Version *v = mvcc_visible(ent, g.clock);
+                if (!v || v->deleted) out_nil(resp);
+                else out_str(resp, v->value.data(), v->value.size());
             }
         }
     } while (rcu_read_retry(&g.rcu, seq));
@@ -375,6 +455,7 @@ static void entry_set_ttl(Entry *ent, int64_t ttl_ms);
 
 static void entry_del_sync(Entry *ent) {
     if (ent->type == T_ZSET) zset_clear(&ent->zset);
+    if (ent->type == T_STR)  mvcc_free_chain(ent);
     delete ent;
 }
 static void entry_del_func(void *arg) { entry_del_sync((Entry*)arg); }
@@ -394,7 +475,10 @@ static void entry_del(Entry *ent) {
 static bool cb_snapshot(HNode *node, void *arg) {
     MMapStore *ms  = (MMapStore *)arg;
     Entry     *ent = container_of(node, Entry, node);
-    if (ent->type == T_STR) mmap_set(ms, ent->key, ent->str);
+    if (ent->type == T_STR) {
+        Version *v = mvcc_visible(ent, g.clock);   // latest committed value
+        if (v && !v->deleted) mmap_set(ms, ent->key, v->value);
+    }
     return true;
 }
 
@@ -422,70 +506,163 @@ static bool str2dbl(const std::string &s, double &out) {
 
 // ── Command handlers ──────────────────────────────────────────────────────────
 
-// do_get is kept for WAL replay only.
-// Live GET requests are dispatched via dispatch_get() → worker_get_func().
-static void do_get(std::vector<std::string> &cmd, Buffer &out) {
-    LookupKey key;
-    key.key.swap(cmd[1]);
-    key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
-    HNode *node = hm_lookup(&g.db, &key.node, &entry_eq);
-    if (!node) return out_nil(out);
-    Entry *ent = container_of(node,Entry,node);
-    if (ent->type != T_STR) return out_err(out,ERR_BAD_TYP,"not a string value");
-    return out_str(out, ent->str.data(), ent->str.size());
+// Look up the string Entry for `key` (nullptr if absent or a non-string type).
+static Entry *str_entry(const std::string &key) {
+    LookupKey lk; lk.key = key;
+    lk.node.hcode = str_hash((uint8_t*)key.data(), key.size());
+    HNode *node = hm_lookup(&g.db, &lk.node, &entry_eq);
+    return node ? container_of(node, Entry, node) : nullptr;
 }
 
-static void do_set(std::vector<std::string> &cmd, Buffer &out) {
-    LookupKey key;
-    key.key.swap(cmd[1]);
-    key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
-
-    if (!g.replaying) {
-        wal_append(&g.wal, WAL_SET, {key.key, cmd[2]});
-        mmap_set(&g.mstore, key.key, cmd[2]);
-    }
-
-    rcu_write_lock(&g.rcu);
-
-    HNode *node = hm_lookup(&g.db, &key.node, &entry_eq);
-    if (node) {
-        Entry *ent = container_of(node,Entry,node);
-        if (ent->type != T_STR) {
-            rcu_write_unlock(&g.rcu);
-            return out_err(out,ERR_BAD_TYP,"a non-string value exists");
+// GET — MVCC read. Inside a transaction: read-your-own-writes, then the
+// snapshot (read_ts); otherwise the latest committed value (g.clock).
+static void do_get(Conn *conn, std::vector<std::string> &cmd, Buffer &out) {
+    const std::string &key = cmd[1];
+    if (conn && conn->txn.active) {
+        auto it = conn->txn.writes.find(key);
+        if (it != conn->txn.writes.end()) {
+            if (it->second.deleted) return out_nil(out);
+            return out_str(out, it->second.value.data(), it->second.value.size());
         }
-        ent->str.swap(cmd[2]);
-    } else {
-        Entry *ent = new Entry();
-        ent->type  = T_STR;
-        ent->key.swap(key.key);
-        ent->node.hcode = key.node.hcode;
-        ent->str.swap(cmd[2]);
+    }
+    uint64_t read_ts = (conn && conn->txn.active) ? conn->txn.read_ts : g.clock;
+    Entry *ent = str_entry(key);
+    if (!ent) return out_nil(out);
+    if (ent->type != T_STR) return out_err(out,ERR_BAD_TYP,"not a string value");
+    Version *v = mvcc_visible(ent, read_ts);
+    if (!v || v->deleted) return out_nil(out);
+    return out_str(out, v->value.data(), v->value.size());
+}
+
+// Apply one committed string write as a new version at commit_ts (also logs to
+// WAL + mmap unless replaying). Caller holds the rcu write lock.
+static bool apply_write(const std::string &key, uint64_t commit_ts,
+                        bool deleted, std::string value) {
+    Entry *ent = str_entry(key);
+    if (ent && ent->type != T_STR) return false;   // type clash — skip
+    if (!ent) {
+        ent = new Entry();
+        ent->type = T_STR; ent->key = key;
+        ent->node.hcode = str_hash((uint8_t*)key.data(), key.size());
         hm_insert(&g.db, &ent->node);
     }
+    if (!g.replaying) {
+        if (deleted) { wal_append(&g.wal, WAL_DEL, {key}); mmap_del(&g.mstore, key); }
+        else { wal_append(&g.wal, WAL_SET, {key, value}); mmap_set(&g.mstore, key, value); }
+    }
+    mvcc_push(ent, commit_ts, deleted, std::move(value));
+    return true;
+}
 
+// SET — buffered in a transaction, otherwise an autocommit version bump.
+static void do_set(Conn *conn, std::vector<std::string> &cmd, Buffer &out) {
+    const std::string &key = cmd[1];
+    Entry *cur = str_entry(key);
+    if (cur && cur->type != T_STR)
+        return out_err(out,ERR_BAD_TYP,"a non-string value exists");
+
+    if (conn && conn->txn.active) {
+        conn->txn.writes[key] = TxnWrite{false, cmd[2]};
+        return out_nil(out);
+    }
+    rcu_write_lock(&g.rcu);
+    apply_write(key, ++g.clock, false, cmd[2]);
     rcu_write_unlock(&g.rcu);
     if (!g.replaying) maybe_checkpoint();
     return out_nil(out);
 }
 
-static void do_del(std::vector<std::string> &cmd, Buffer &out) {
-    LookupKey key;
-    key.key.swap(cmd[1]);
-    key.node.hcode = str_hash((uint8_t*)key.key.data(), key.key.size());
+// DEL — buffered in a transaction, otherwise an autocommit tombstone.
+static void do_del(Conn *conn, std::vector<std::string> &cmd, Buffer &out) {
+    const std::string &key = cmd[1];
+    Entry *ent = str_entry(key);
 
-    if (!g.replaying) {
-        wal_append(&g.wal, WAL_DEL, {key.key});
-        mmap_del(&g.mstore, key.key);
+    if (conn && conn->txn.active) {
+        bool existed = false;
+        auto it = conn->txn.writes.find(key);
+        if (it != conn->txn.writes.end()) existed = !it->second.deleted;
+        else if (ent && ent->type == T_STR) {
+            Version *v = mvcc_visible(ent, conn->txn.read_ts);
+            existed = v && !v->deleted;
+        } else if (ent && ent->type == T_ZSET) existed = true;
+        conn->txn.writes[key] = TxnWrite{true, ""};
+        return out_int(out, existed ? 1 : 0);
     }
 
+    // Autocommit. ZSet keys are not versioned — delete them physically.
+    if (ent && ent->type == T_ZSET) {
+        LookupKey lk; lk.key = key;
+        lk.node.hcode = str_hash((uint8_t*)key.data(), key.size());
+        rcu_write_lock(&g.rcu);
+        HNode *node = hm_delete(&g.db, &lk.node, &entry_eq);
+        rcu_write_unlock(&g.rcu);
+        if (node) entry_del(container_of(node,Entry,node));
+        if (!g.replaying) maybe_checkpoint();
+        return out_int(out, 1);
+    }
+    Version *v = ent ? mvcc_visible(ent, g.clock) : nullptr;
+    bool existed = v && !v->deleted;
+    if (existed) {
+        rcu_write_lock(&g.rcu);
+        apply_write(key, ++g.clock, true, "");
+        rcu_write_unlock(&g.rcu);
+        if (!g.replaying) maybe_checkpoint();
+    }
+    return out_int(out, existed ? 1 : 0);
+}
+
+// ── MVCC transaction control ────────────────────────────────────────────────
+
+static void do_begin(Conn *conn, Buffer &out) {
+    if (conn->txn.active) return out_err(out,ERR_UNKNOWN,"already in transaction");
+    conn->txn.active  = true;
+    conn->txn.read_ts = g.clock;
+    conn->txn.writes.clear();
+    g.active_snaps.insert(conn->txn.read_ts);
+    return out_str(out, "OK", 2);
+}
+
+static void txn_end(Conn *conn) {
+    auto it = g.active_snaps.find(conn->txn.read_ts);
+    if (it != g.active_snaps.end()) g.active_snaps.erase(it);
+    conn->txn.active = false;
+    conn->txn.writes.clear();
+}
+
+static void do_rollback(Conn *conn, Buffer &out) {
+    if (!conn->txn.active) return out_err(out,ERR_UNKNOWN,"no transaction in progress");
+    txn_end(conn);
+    return out_str(out, "OK", 2);
+}
+
+static void do_commit(Conn *conn, Buffer &out) {
+    if (!conn->txn.active) return out_err(out,ERR_UNKNOWN,"no transaction in progress");
+
+    // Write-write conflict check (snapshot isolation, first-committer-wins):
+    // abort if any key in the write set was committed after our snapshot.
+    for (auto &kv : conn->txn.writes) {
+        Entry *ent = str_entry(kv.first);
+        if (!ent) continue;
+        if (ent->type != T_STR) {
+            txn_end(conn);
+            return out_err(out,ERR_BAD_TYP,"a non-string value exists; transaction aborted");
+        }
+        if (ent->vhead && ent->vhead->commit_ts > conn->txn.read_ts) {
+            txn_end(conn);
+            return out_err(out,ERR_UNKNOWN,"write-write conflict; transaction aborted");
+        }
+    }
+
+    // No conflict — apply every buffered write atomically at one commit_ts.
+    uint64_t ct = ++g.clock;
     rcu_write_lock(&g.rcu);
-    HNode *node = hm_delete(&g.db, &key.node, &entry_eq);
+    for (auto &kv : conn->txn.writes)
+        apply_write(kv.first, ct, kv.second.deleted, kv.second.value);
     rcu_write_unlock(&g.rcu);
 
-    if (node) entry_del(container_of(node,Entry,node));
+    txn_end(conn);
     if (!g.replaying) maybe_checkpoint();
-    return out_int(out, node ? 1 : 0);
+    return out_str(out, "OK", 2);
 }
 
 static void heap_delete(std::vector<HeapItem> &a, size_t pos) {
@@ -533,14 +710,20 @@ static void do_ttl(std::vector<std::string> &cmd, Buffer &out) {
 }
 
 static bool cb_keys(HNode *node, void *arg) {
-    Buffer &out = *(Buffer*)arg;
-    out_str(out, container_of(node,Entry,node)->key.data(),
-                 container_of(node,Entry,node)->key.size());
+    std::vector<const std::string*> &keys = *(std::vector<const std::string*>*)arg;
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->type == T_STR) {
+        Version *v = mvcc_visible(ent, g.clock);
+        if (!v || v->deleted) return true;     // skip tombstoned keys
+    }
+    keys.push_back(&ent->key);
     return true;
 }
 static void do_keys(std::vector<std::string> &, Buffer &out) {
-    out_arr(out,(uint32_t)hm_size(&g.db));
-    hm_foreach(&g.db, &cb_keys, &out);
+    std::vector<const std::string*> keys;
+    hm_foreach(&g.db, &cb_keys, &keys);
+    out_arr(out,(uint32_t)keys.size());
+    for (const std::string *k : keys) out_str(out, k->data(), k->size());
 }
 
 static void do_zadd(std::vector<std::string> &cmd, Buffer &out) {
@@ -641,18 +824,24 @@ static void do_info(Buffer &out) {
     out_str(out, buf, (size_t)n);
 }
 
-static void do_request(std::vector<std::string> &cmd, Buffer &out) {
-    if      (cmd.size()==1 && cmd[0]=="info")    do_info(out);
-    else if (cmd.size()==2 && cmd[0]=="get")     do_get(cmd,out);
-    else if (cmd.size()==3 && cmd[0]=="set")     do_set(cmd,out);
-    else if (cmd.size()==2 && cmd[0]=="del")     do_del(cmd,out);
-    else if (cmd.size()==3 && cmd[0]=="pexpire") do_expire(cmd,out);
-    else if (cmd.size()==2 && cmd[0]=="pttl")    do_ttl(cmd,out);
-    else if (cmd.size()==1 && cmd[0]=="keys")    do_keys(cmd,out);
-    else if (cmd.size()==4 && cmd[0]=="zadd")    do_zadd(cmd,out);
-    else if (cmd.size()==3 && cmd[0]=="zrem")    do_zrem(cmd,out);
-    else if (cmd.size()==3 && cmd[0]=="zscore")  do_zscore(cmd,out);
-    else if (cmd.size()==6 && cmd[0]=="zquery")  do_zquery(cmd,out);
+static void do_request(Conn *conn, std::vector<std::string> &cmd, Buffer &out) {
+    if      (cmd.size()==1 && cmd[0]=="info")     do_info(out);
+    else if (cmd.size()==2 && cmd[0]=="get")      do_get(conn,cmd,out);
+    else if (cmd.size()==3 && cmd[0]=="set")      do_set(conn,cmd,out);
+    else if (cmd.size()==2 && cmd[0]=="del")      do_del(conn,cmd,out);
+    else if (cmd.size()==1 && cmd[0]=="begin")    { if (conn) do_begin(conn,out);
+                                                    else out_err(out,ERR_UNKNOWN,"no connection"); }
+    else if (cmd.size()==1 && cmd[0]=="commit")   { if (conn) do_commit(conn,out);
+                                                    else out_err(out,ERR_UNKNOWN,"no connection"); }
+    else if (cmd.size()==1 && cmd[0]=="rollback") { if (conn) do_rollback(conn,out);
+                                                    else out_err(out,ERR_UNKNOWN,"no connection"); }
+    else if (cmd.size()==3 && cmd[0]=="pexpire")  do_expire(cmd,out);
+    else if (cmd.size()==2 && cmd[0]=="pttl")     do_ttl(cmd,out);
+    else if (cmd.size()==1 && cmd[0]=="keys")     do_keys(cmd,out);
+    else if (cmd.size()==4 && cmd[0]=="zadd")     do_zadd(cmd,out);
+    else if (cmd.size()==3 && cmd[0]=="zrem")     do_zrem(cmd,out);
+    else if (cmd.size()==3 && cmd[0]=="zscore")   do_zscore(cmd,out);
+    else if (cmd.size()==6 && cmd[0]=="zquery")   do_zquery(cmd,out);
     else out_err(out,ERR_UNKNOWN,"unknown command");
 }
 
@@ -692,14 +881,26 @@ static void response_end(Buffer &out, size_t hdr) {
 // read remains safe if reads are offloaded again.) dispatch_get/worker_get_func
 // are retained for that path and for WAL replay.
 static void inline_get(Conn *conn, const std::string &key) {
+    size_t hdr;
+    response_begin(conn->outgoing, &hdr);
+
+    // Read-your-own-writes inside a transaction: serve from the write set.
+    if (conn->txn.active) {
+        auto it = conn->txn.writes.find(key);
+        if (it != conn->txn.writes.end()) {
+            if (it->second.deleted) out_nil(conn->outgoing);
+            else out_str(conn->outgoing, it->second.value.data(), it->second.value.size());
+            response_end(conn->outgoing, hdr);
+            return;
+        }
+    }
+    uint64_t read_ts = conn->txn.active ? conn->txn.read_ts : g.clock;
+
     LookupKey lk;
     lk.key        = key;
     lk.node.hcode = str_hash((uint8_t*)key.data(), key.size());
 
-    size_t hdr;
-    response_begin(conn->outgoing, &hdr);
     size_t body_start = conn->outgoing.size();
-
     uint64_t seq;
     do {
         conn->outgoing.resize(body_start);   // drop any partial body from a retry
@@ -713,8 +914,10 @@ static void inline_get(Conn *conn, const std::string &key) {
             if (ent->type != T_STR) {
                 out_err(conn->outgoing, ERR_BAD_TYP, "not a string value");
             } else {
-                std::string val = ent->str;
-                out_str(conn->outgoing, val.data(), val.size());
+                // MVCC visibility: newest version at/below the snapshot.
+                Version *v = mvcc_visible(ent, read_ts);
+                if (!v || v->deleted) out_nil(conn->outgoing);
+                else out_str(conn->outgoing, v->value.data(), v->value.size());
             }
         }
     } while (rcu_read_retry(&g.rcu, seq));
@@ -752,7 +955,7 @@ static bool try_one_request(Conn *conn) {
 
     size_t hdr = 0;
     response_begin(conn->outgoing, &hdr);
-    do_request(cmd, conn->outgoing);
+    do_request(conn, cmd, conn->outgoing);
     response_end(conn->outgoing, hdr);
     buf_consume(conn->incoming, 4+len);
     return true;
@@ -906,9 +1109,9 @@ static void wal_replay(WALOp op, const std::vector<std::string> &args) {
     Buffer dummy;
     switch (op) {
     case WAL_SET:
-        if (args.size() >= 2) { cmd={"set",args[0],args[1]}; do_set(cmd,dummy); } break;
+        if (args.size() >= 2) { cmd={"set",args[0],args[1]}; do_set(nullptr,cmd,dummy); } break;
     case WAL_DEL:
-        if (args.size() >= 1) { cmd={"del",args[0]}; do_del(cmd,dummy); } break;
+        if (args.size() >= 1) { cmd={"del",args[0]}; do_del(nullptr,cmd,dummy); } break;
     case WAL_ZADD:
         if (args.size() >= 3) { cmd={"zadd",args[0],args[1],args[2]}; do_zadd(cmd,dummy); } break;
     case WAL_ZREM:
@@ -928,14 +1131,16 @@ static void mmap_replay(const std::string &key, const std::string &val) {
         LookupKey lk; lk.key = key;
         lk.node.hcode = str_hash((uint8_t*)key.data(), key.size());
         HNode *n = hm_lookup(&g.db, &lk.node, &entry_eq);
+        Entry *ent;
         if (n) {
-            container_of(n, Entry, node)->str = val;
+            ent = container_of(n, Entry, node);
         } else {
-            Entry *ent = new Entry();
+            ent = new Entry();
             ent->type  = T_STR; ent->key = key;
-            ent->node.hcode = lk.node.hcode; ent->str = val;
+            ent->node.hcode = lk.node.hcode;
             hm_insert(&g.db, &ent->node);
         }
+        mvcc_push(ent, ++g.clock, false, val);
     }
 }
 

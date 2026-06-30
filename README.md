@@ -166,6 +166,40 @@ Event loop                  Thread pool workers         Wakeup pipe
     │    conn re-enabled           │
 ```
 
+### MVCC — multi-version concurrency control & transactions
+
+String keys are stored as **version chains** rather than single values, giving real **snapshot-isolation transactions**. Each key owns a linked list of versions, newest first:
+
+```
+Entry "k"
+└── vhead → Version{commit_ts=7, "v3"} → Version{commit_ts=4, "v2"} → Version{commit_ts=2, "v1"} → ∅
+```
+
+- **Global commit clock** (`g.clock`): a monotonically increasing timestamp; every committed write gets one.
+- **Snapshot reads**: a transaction fixes `read_ts = g.clock` at `BEGIN`; every read returns the newest version with `commit_ts <= read_ts`. Writes committed by other connections *after* that point are invisible — a stable, consistent snapshot. Autocommit reads use `read_ts = g.clock` (latest committed).
+- **Buffered writes + read-your-own-writes**: a transaction's `SET`/`DEL` go into a per-connection write set; the transaction reads its own pending writes, but no other connection sees them until commit.
+- **Atomic commit at one timestamp**: `COMMIT` assigns a single `commit_ts = ++g.clock` and installs every buffered write as a new version, so they all become visible together. The records are WAL-appended and group-committed in the same batch — the durability contract composes with [group commit](#optimization-2--wal-group-commit-the-write-path-unlock).
+- **Write-write conflict detection (first-committer-wins)**: at `COMMIT`, if any key in the write set has a head version newer than the transaction's `read_ts`, the transaction aborts. This prevents lost updates — true snapshot isolation, not just atomic batching.
+- **Garbage collection**: a `std::multiset` tracks the read timestamps of in-flight transactions; on each write the chain is pruned of versions older than the newest one still visible to the oldest live snapshot, bounding chain length.
+- **`DEL` is a tombstone version**, so a concurrent snapshot can still see the pre-delete value; `keys` skips tombstoned entries.
+
+```text
+A: SET k v0
+A: BEGIN              # read_ts = 5
+A: GET k  → v0
+B: SET k v1           # commits at ts 6
+A: GET k  → v0        # A still sees its snapshot, not v1
+A: COMMIT
+A: GET k  → v1        # now sees latest
+
+A: BEGIN; B: BEGIN    # both snapshot the same state
+A: SET c A; B: SET c B
+A: COMMIT  → OK
+B: COMMIT  → ERR write-write conflict; transaction aborted
+```
+
+The fast read path stays fast: with no transactions a key has a single version whose `commit_ts <= g.clock`, so the inline-GET path returns the head in O(1) — the common case is unchanged. *Scope:* MVCC versioning covers the string keyspace (`GET`/`SET`/`DEL`); ZSets and TTLs are not versioned, and snapshots do not survive a restart (replay rebuilds the latest committed state). Verified by `test_mvcc` and `test_mvcc_durability` in the integration suite.
+
 ---
 
 ## Technologies & Libraries
@@ -290,7 +324,7 @@ make test         # build + run the full test suite (unit + integration)
 | Hash table | [`tests/test_hashtable.cpp`](tests/test_hashtable.cpp) | insert / lookup / delete / size; 5 000-key progressive-rehash stress |
 | Sorted set | [`tests/test_zset.cpp`](tests/test_zset.cpp) | insert, score update, delete, `seekge` ordering, `znode_offset` arithmetic |
 | Write-ahead log | [`tests/test_wal.cpp`](tests/test_wal.cpp) | append/sync group commit, replay, **CRC-mismatch truncation**, **partial-tail recovery**, checkpoint |
-| Integration | [`tests/test_integration.py`](tests/test_integration.py) | drives the real `kvs` server over TCP — string/zset/expire commands, type errors, `INFO` + group-commit invariant, 200-deep pipelined GET, and **`SIGKILL` crash recovery (100/100 keys replayed)** |
+| Integration | [`tests/test_integration.py`](tests/test_integration.py) | drives the real `kvs` server over TCP — commands, type errors, `INFO` + group-commit invariant, 200-deep pipelined GET, **MVCC snapshot isolation / read-your-writes / write-write conflict / transactional durability**, and **`SIGKILL` crash recovery (100/100 keys replayed)** |
 | Parser fuzzer | [`tests/fuzz_parser.cpp`](tests/fuzz_parser.cpp) | the wire-protocol parser ([`engine/protocol.h`](engine/protocol.h)) under **ASAN + UBSAN** — correctness regressions plus ~50k random/adversarial inputs |
 
 The WAL and crash-recovery tests directly guard the durability contract behind [WAL group commit](#optimization-2--wal-group-commit-the-write-path-unlock): a mutation is acked only after `fdatasync`, and a killed server replays every acked write. The pipelined-GET test guards the [inline-GET fast-path](#optimization-1--inline-get-fast-path-the-throughput-unlock).
@@ -301,7 +335,7 @@ make test
 # ── tests/test_zset ──        PASSED: 21 checks, 0 failed
 # ── tests/test_wal ──         PASSED: 16 checks, 0 failed
 # ── tests/fuzz_parser ──      PASSED: correctness + ~50k fuzz iterations, 0 failed
-# ── tests/test_integration ── PASSED: 32 checks, 0 failed
+# ── tests/test_integration ── PASSED: 51 checks, 0 failed
 ```
 
 ### Fuzzing & input hardening
@@ -438,6 +472,9 @@ Tags: 0=nil  1=err  2=str  3=int  4=dbl  5=arr
 | `zscore <key> <member>` | 3 | dbl or nil |
 | `zquery <key> <score> <name> <offset> <limit>` | 6 | arr |
 | `info` | 1 | str (server metrics) |
+| `begin` | 1 | str (`OK`) — start an MVCC transaction |
+| `commit` | 1 | str (`OK`) or err on write-write conflict |
+| `rollback` | 1 | str (`OK`) — discard buffered writes |
 
 ---
 
@@ -541,9 +578,9 @@ timestamp_ms,ops_in_window,gpu_util_pct,mem_used_mb,power_watts,p99_us_in_window
 
 `fdatasync()` was previously called on every single write. It is now batched: `wal_append` buffers records and `wal_sync` issues one `fdatasync` per pipeline batch (in `handle_read`, before any response is flushed). This lifted the 80/20 mixed workload from 117k → **396k ops/s** with the same durability contract. See [Optimization #2](#optimization-2--wal-group-commit-the-write-path-unlock).
 
-### 6. Seqlock RCU — `std::string` copy safety
+### 6. Seqlock RCU — version-copy safety
 
-`Entry::str` is a `std::string`. If a writer calls `ent->str.swap(cmd[2])` while a reader is copying `ent->str`, there is a theoretical window for undefined behavior even with the seqlock retry. A production fix would store string values as raw byte arrays or use a hazard pointer. Documented as accepted tradeoff for this implementation.
+String values now live in immutable [MVCC version chains](#mvcc--multi-version-concurrency-control--transactions): a write *prepends* a new `Version` rather than mutating an existing `std::string` in place, which removes the original reader/writer copy race on the value itself. A residual concern remains around concurrent pruning of old versions if reads are ever moved back onto worker threads; with reads inline on the single event-loop thread today there is no live data race. A production fix for the offload path would be epoch-based reclamation or hazard pointers. Documented as an accepted tradeoff.
 
 ---
 
@@ -556,7 +593,8 @@ timestamp_ms,ops_in_window,gpu_util_pct,mem_used_mb,power_watts,p99_us_in_window
 | Persistence | None | mmap snapshot + WAL replay |
 | Concurrent reads | Blocked by writes | Seqlock RCU — readers run in parallel |
 | Accept bottleneck | One `accept()` per EV_READ | Drain loop — handles burst arrivals |
-| Observability | None | p50/p99/p999 + GPU correlation CSV |
+| Observability | None | p50/p99/p999 + GPU correlation CSV + `INFO` metrics |
+| Transactions | None | **MVCC snapshot isolation** — `BEGIN`/`COMMIT`/`ROLLBACK`, write-write conflict detection |
 | Commands | SET / GET / DEL / ZADD / etc. | Same + WAL-logged + snapshot-backed |
 
 **Throughput headroom:** At pipeline=64, `kvs` reaches ~836k GET ops/s (and ~396k ops/s under an 80/20 mixed workload) on a single loopback connection on a laptop — median of 7 runs, see [Benchmark Results](#benchmark-results). These are single-connection loopback figures, not networked throughput; they rose 6.4× / 3.4× after the inline-GET and WAL group-commit optimizations. On a server-class machine with real network and many connections, the kqueue/epoll model eliminates the O(N) poll bottleneck and scales across connections rather than relying on deeper pipelining of one connection.

@@ -210,6 +210,83 @@ def test_pipeline(s):
     check(ok == n, f"pipelined GET: {ok}/{n} correct")
 
 
+def test_mvcc(workdir):
+    # MVCC needs two independent connections to show snapshot isolation.
+    proc = start_server(workdir)
+    a = socket.create_connection((HOST, PORT))
+    b = socket.create_connection((HOST, PORT))
+    try:
+        # ── Snapshot isolation: A's read snapshot is fixed at BEGIN ──
+        call(a, "set", "k", "v0")
+        check(call(a, "begin") == "OK", "BEGIN returns OK")
+        check(call(a, "get", "k") == "v0", "txn reads its snapshot")
+        call(b, "set", "k", "v1")                       # committed by B mid-txn
+        check(call(a, "get", "k") == "v0",
+              "txn does NOT see writes committed after its snapshot")
+        check(call(a, "commit") == "OK", "COMMIT returns OK")
+        check(call(a, "get", "k") == "v1", "after commit, sees latest")
+
+        # ── Read-your-own-writes + rollback ──
+        call(a, "begin")
+        call(a, "set", "k", "local")
+        check(call(a, "get", "k") == "local", "txn reads its own buffered write")
+        check(call(b, "get", "k") == "v1", "other conn does not see uncommitted write")
+        check(call(a, "rollback") == "OK", "ROLLBACK returns OK")
+        check(call(a, "get", "k") == "v1", "rollback discards buffered writes")
+
+        # ── Write-write conflict: first committer wins ──
+        call(a, "set", "c", "base")
+        call(a, "begin")
+        call(b, "begin")
+        call(a, "set", "c", "A")
+        call(b, "set", "c", "B")
+        check(call(a, "commit") == "OK", "first committer succeeds")
+        rb = call(b, "commit")
+        check(isinstance(rb, tuple) and rb[0] == "ERR",
+              "second committer aborts on write-write conflict")
+        check(call(a, "get", "c") == "A", "winning value persists")
+
+        # ── DEL inside a transaction ──
+        call(a, "set", "d", "x")
+        call(a, "begin")
+        check(call(a, "del", "d") == 1, "txn DEL reports the key existed")
+        check(call(a, "get", "d") is None, "txn sees its own delete")
+        call(a, "commit")
+        check(call(a, "get", "d") is None, "committed delete is visible")
+
+        # ── Errors on misuse ──
+        check(isinstance(call(a, "commit"), tuple), "COMMIT with no txn errors")
+        check(isinstance(call(a, "rollback"), tuple), "ROLLBACK with no txn errors")
+    finally:
+        a.close()
+        b.close()
+        stop_server(proc, hard=True)
+
+
+def test_mvcc_durability(workdir):
+    # A committed transaction must survive a crash; an uncommitted one must not.
+    proc = start_server(workdir)
+    s = socket.create_connection((HOST, PORT))
+    call(s, "begin")
+    for i in range(20):
+        call(s, "set", f"tx{i}", f"val{i}")
+    call(s, "commit")
+    # An open, uncommitted transaction whose writes must be lost on crash.
+    call(s, "begin")
+    call(s, "set", "ghost", "should_vanish")
+    s.close()                                   # connection drops mid-transaction
+    stop_server(proc, hard=True)
+
+    proc = start_server(workdir)
+    s = socket.create_connection((HOST, PORT))
+    committed = sum(1 for i in range(20)
+                    if call(s, "get", f"tx{i}") == f"val{i}")
+    check(committed == 20, f"committed txn survives crash: {committed}/20")
+    check(call(s, "get", "ghost") is None, "uncommitted txn write is not persisted")
+    s.close()
+    stop_server(proc, hard=True)
+
+
 def test_crash_recovery(workdir):
     proc = start_server(workdir)
     s = socket.create_connection((HOST, PORT))
@@ -248,6 +325,10 @@ def main():
             s.close()
             stop_server(proc, hard=True)
 
+        print("  • test_mvcc")
+        test_mvcc(workdir)
+        print("  • test_mvcc_durability")
+        test_mvcc_durability(workdir)
         print("  • test_crash_recovery")
         test_crash_recovery(workdir)
     finally:
