@@ -290,7 +290,8 @@ make test         # build + run the full test suite (unit + integration)
 | Hash table | [`tests/test_hashtable.cpp`](tests/test_hashtable.cpp) | insert / lookup / delete / size; 5 000-key progressive-rehash stress |
 | Sorted set | [`tests/test_zset.cpp`](tests/test_zset.cpp) | insert, score update, delete, `seekge` ordering, `znode_offset` arithmetic |
 | Write-ahead log | [`tests/test_wal.cpp`](tests/test_wal.cpp) | append/sync group commit, replay, **CRC-mismatch truncation**, **partial-tail recovery**, checkpoint |
-| Integration | [`tests/test_integration.py`](tests/test_integration.py) | drives the real `kvs` server over TCP — string/zset/expire commands, type errors, 200-deep pipelined GET, and **`SIGKILL` crash recovery (100/100 keys replayed)** |
+| Integration | [`tests/test_integration.py`](tests/test_integration.py) | drives the real `kvs` server over TCP — string/zset/expire commands, type errors, `INFO` + group-commit invariant, 200-deep pipelined GET, and **`SIGKILL` crash recovery (100/100 keys replayed)** |
+| Parser fuzzer | [`tests/fuzz_parser.cpp`](tests/fuzz_parser.cpp) | the wire-protocol parser ([`engine/protocol.h`](engine/protocol.h)) under **ASAN + UBSAN** — correctness regressions plus ~50k random/adversarial inputs |
 
 The WAL and crash-recovery tests directly guard the durability contract behind [WAL group commit](#optimization-2--wal-group-commit-the-write-path-unlock): a mutation is acked only after `fdatasync`, and a killed server replays every acked write. The pipelined-GET test guards the [inline-GET fast-path](#optimization-1--inline-get-fast-path-the-throughput-unlock).
 
@@ -299,8 +300,18 @@ make test
 # ── tests/test_hashtable ──   PASSED: 5013 checks, 0 failed
 # ── tests/test_zset ──        PASSED: 21 checks, 0 failed
 # ── tests/test_wal ──         PASSED: 16 checks, 0 failed
+# ── tests/fuzz_parser ──      PASSED: correctness + ~50k fuzz iterations, 0 failed
 # ── tests/test_integration ── PASSED: 32 checks, 0 failed
 ```
+
+### Fuzzing & input hardening
+
+The wire-protocol parser is the server's primary attack surface — it turns raw, untrusted socket bytes into commands — so it's isolated in [`engine/protocol.h`](engine/protocol.h) and fuzzed. [`tests/fuzz_parser.cpp`](tests/fuzz_parser.cpp) builds two ways from one file:
+
+- **Standalone** (default, part of `make test`): a seeded harness feeds correctness cases plus ~50k random and adversarial framings (oversized `nstr`, lying length fields, truncated frames, trailing garbage) to `parse_req` under **AddressSanitizer + UndefinedBehaviorSanitizer**. Portable across clang and g++, so CI runs it on Linux and macOS. *Verified to fail*: planting a deliberate off-by-bounds in `read_str` makes ASan abort immediately.
+- **libFuzzer** (`make fuzz-libfuzzer`, where the toolchain ships it): coverage-guided campaign via `LLVMFuzzerTestOneInput`.
+
+This exercise also **hardened the parser**: the bounds checks now compare a length against the *remaining* byte count (`n > (size_t)(end - cur)`) instead of `cur + n > end`, eliminating pointer-arithmetic overflow on adversarial length fields.
 
 ---
 

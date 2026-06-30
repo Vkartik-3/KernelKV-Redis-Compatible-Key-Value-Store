@@ -27,6 +27,7 @@
 #include "../core/thread_pool.h"
 // new modules
 #include "event_loop.h"
+#include "protocol.h"
 #include "wal.h"
 #include "mmap_store.h"
 #include "rcu.h"
@@ -50,7 +51,8 @@ static void fd_set_nb(int fd) {
 }
 
 const size_t k_max_msg  = 32 << 20;
-const size_t k_max_args = 200 * 1000;
+// k_max_args + read_u32/read_str/parse_req live in engine/protocol.h so the
+// parser can be unit tested and fuzzed in isolation.
 
 
 // ── Buffer ────────────────────────────────────────────────────────────────────
@@ -96,29 +98,7 @@ static void out_end_arr(Buffer &o, size_t ctx, uint32_t n) {
     assert(o[ctx-1]==TAG_ARR); memcpy(&o[ctx],&n,4);
 }
 
-static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out) {
-    if (cur+4 > end) return false;
-    memcpy(&out,cur,4); cur+=4; return true;
-}
-static bool read_str(const uint8_t *&cur, const uint8_t *end,
-                     size_t n, std::string &out) {
-    if (cur+n > end) return false;
-    out.assign(cur,cur+n); cur+=n; return true;
-}
-static int32_t parse_req(const uint8_t *data, size_t size,
-                          std::vector<std::string> &out) {
-    const uint8_t *end = data+size;
-    uint32_t nstr = 0;
-    if (!read_u32(data,end,nstr)) return -1;
-    if (nstr > k_max_args) return -1;
-    while (out.size() < nstr) {
-        uint32_t len = 0;
-        if (!read_u32(data,end,len)) return -1;
-        out.push_back(std::string());
-        if (!read_str(data,end,len,out.back())) return -1;
-    }
-    return (data==end) ? 0 : -1;
-}
+// read_u32 / read_str / parse_req are defined in engine/protocol.h.
 
 
 // ── Dispatch structs (declared early — used by Conn, g, worker functions) ─────

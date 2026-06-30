@@ -75,11 +75,25 @@ tests/test_zset: tests/test_zset.cpp tests/test_util.h \
 tests/test_wal: tests/test_wal.cpp tests/test_util.h engine/wal.cpp engine/wal.h
 	$(CXX) $(CXXFLAGS) -o $@ tests/test_wal.cpp engine/wal.cpp $(LDFLAGS)
 
-# Unit tests (data structures + WAL) followed by the end-to-end integration
-# suite (drives the real server over TCP, including SIGKILL crash recovery).
-test: $(TEST_BIN) kvs
+# Wire-protocol parser fuzzer, portable standalone mode: random + adversarial
+# inputs run under AddressSanitizer + UndefinedBehaviorSanitizer. Works with
+# both clang and g++, so it runs in CI on Linux and macOS.
+tests/fuzz_parser: tests/fuzz_parser.cpp engine/protocol.h
+	$(CXX) $(CXXFLAGS) -g -fsanitize=address,undefined -o $@ tests/fuzz_parser.cpp $(LDFLAGS)
+
+# Unit tests (data structures + WAL), the parser fuzzer, then the end-to-end
+# integration suite (drives the real server over TCP, including SIGKILL recovery).
+test: $(TEST_BIN) tests/fuzz_parser kvs
 	@set -e; for t in $(TEST_BIN); do echo "── $$t ──"; ./$$t; done
+	@echo "── tests/fuzz_parser ──"; ./tests/fuzz_parser
 	@echo "── tests/test_integration.py ──"; python3 tests/test_integration.py
+
+# Coverage-guided libFuzzer build (requires clang shipping libFuzzer, e.g.
+# Linux). Runs a 60s campaign. Not part of `make test` (toolchain-dependent).
+fuzz-libfuzzer: tests/fuzz_parser.cpp engine/protocol.h
+	clang++ -std=gnu++17 -g -O1 -DUSE_LIBFUZZER \
+	    -fsanitize=fuzzer,address,undefined -o tests/fuzz_parser_lf tests/fuzz_parser.cpp
+	./tests/fuzz_parser_lf -max_total_time=60 -print_final_stats=1
 
 # ── convenience ───────────────────────────────────────────────────────────────
 
@@ -97,4 +111,5 @@ run-bench: bench/bench
 	./bench/bench 127.0.0.1 1234 100000 16
 
 clean:
-	rm -f kvs-base kvs bench/bench redis.dat redis.wal $(TEST_BIN)
+	rm -f kvs-base kvs bench/bench redis.dat redis.wal $(TEST_BIN) \
+	      tests/fuzz_parser tests/fuzz_parser_lf

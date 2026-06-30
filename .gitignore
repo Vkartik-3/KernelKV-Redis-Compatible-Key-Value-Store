@@ -5,7 +5,10 @@ bench/bench
 tests/test_hashtable
 tests/test_zset
 tests/test_wal
+tests/fuzz_parser
+tests/fuzz_parser_lf
 tests/*.tmp
+tests/*.dSYM
 
 # Persistence files generated at runtime
 redis.dat
