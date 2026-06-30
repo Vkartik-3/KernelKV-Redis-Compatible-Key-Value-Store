@@ -59,11 +59,33 @@ bench/bench: $(BENCH_SRCS) bench/gpu_profiler.h
 
 bench: bench/bench
 
+# ── tests ─────────────────────────────────────────────────────────────────────
+
+TEST_BIN := tests/test_hashtable tests/test_zset tests/test_wal
+
+tests/test_hashtable: tests/test_hashtable.cpp tests/test_util.h \
+                      core/hashtable.cpp core/hashtable.h core/common.h
+	$(CXX) $(CXXFLAGS) -o $@ tests/test_hashtable.cpp core/hashtable.cpp $(LDFLAGS)
+
+tests/test_zset: tests/test_zset.cpp tests/test_util.h \
+                 core/zset.cpp core/avl.cpp core/hashtable.cpp \
+                 core/zset.h core/avl.h core/hashtable.h
+	$(CXX) $(CXXFLAGS) -o $@ tests/test_zset.cpp core/zset.cpp core/avl.cpp core/hashtable.cpp $(LDFLAGS)
+
+tests/test_wal: tests/test_wal.cpp tests/test_util.h engine/wal.cpp engine/wal.h
+	$(CXX) $(CXXFLAGS) -o $@ tests/test_wal.cpp engine/wal.cpp $(LDFLAGS)
+
+# Unit tests (data structures + WAL) followed by the end-to-end integration
+# suite (drives the real server over TCP, including SIGKILL crash recovery).
+test: $(TEST_BIN) kvs
+	@set -e; for t in $(TEST_BIN); do echo "── $$t ──"; ./$$t; done
+	@echo "── tests/test_integration.py ──"; python3 tests/test_integration.py
+
 # ── convenience ───────────────────────────────────────────────────────────────
 
 all: kvs-base kvs bench/bench
 
-.PHONY: all clean run-base run run-bench bench
+.PHONY: all clean run-base run run-bench bench test
 
 run-base: kvs-base
 	./kvs-base
@@ -75,4 +97,4 @@ run-bench: bench/bench
 	./bench/bench 127.0.0.1 1234 100000 16
 
 clean:
-	rm -f kvs-base kvs bench/bench redis.dat redis.wal
+	rm -f kvs-base kvs bench/bench redis.dat redis.wal $(TEST_BIN)

@@ -2,6 +2,10 @@
 kvs-base
 kvs
 bench/bench
+tests/test_hashtable
+tests/test_zset
+tests/test_wal
+tests/*.tmp
 
 # Persistence files generated at runtime
 redis.dat
