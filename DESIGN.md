@@ -147,7 +147,7 @@ TTLs not versioned; snapshots don't survive restart; single-node/single-thread.
 | **Max-memory + LRU** | intrusive `DList lru_node` (O(1)); `maybe_evict` from LRU end; MVCC-safe; reads don't touch LRU | LRU eviction, cache policy, memory management |
 | **Tombstone GC** | `gc_reapable` (head deleted, `commit_ts <= min_active`); throttled ~1/s, bounded sweep in `process_timers` | garbage collection, tombstone reclamation |
 | **Prometheus `/metrics`** | 2nd listener; `serve_metrics` speaks minimal HTTP/1.1 + text-exposition | Prometheus, OpenMetrics, HTTP endpoint |
-| **TLS** | stunnel sidecar (`deploy/stunnel.conf`), terminates TLS → plaintext loopback | TLS termination, encryption in transit, sidecar |
+| **TLS** | **in-process TLS 1.3** (OpenSSL, `make kvs TLS=1`): `conn_recv`/`conn_send` wrap `SSL_read`/`SSL_write`, non-blocking handshake via `tls_advance_handshake`, TLS 1.3 pinned to avoid the WANT_READ/WANT_WRITE inversion; also stunnel sidecar | OpenSSL, TLS 1.3, SSL_read/SSL_write, non-blocking TLS handshake, X.509, encryption in transit |
 
 **Verified:** `test_auth`, `test_graceful_shutdown`, `test_maxmemory_eviction`,
 `test_metrics_endpoint`.
@@ -172,5 +172,5 @@ Not a production database — a single-node engine implementing production
 *techniques*. Remaining, in priority order: **distribution** (replication/
 failover/sharding), **multi-core** (thread-per-core; rearchitects the
 single-thread invariant everything relies on), **serializable isolation (SSI)**
-+ **versioned sorted sets**, **in-process OpenSSL TLS**, and incremental
-cursor-based GC. Everything under "Security & operability" is implemented.
++ **versioned sorted sets**, and incremental cursor-based GC. Everything under
+"Security & operability" — including in-process TLS 1.3 — is implemented.

@@ -15,6 +15,10 @@
 #include <netinet/ip.h>
 #include <signal.h>
 #include <stdarg.h>
+#ifdef HAVE_TLS
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#endif
 // C++
 #include <string>
 #include <vector>
@@ -65,6 +69,8 @@ static struct Config {
     int         max_clients  = 10000;   // reject connections beyond this
     int         metrics_port = 0;       // Prometheus /metrics; 0 = disabled
     int         log_level    = 1;       // 0=debug 1=info 2=warn 3=error
+    std::string tls_cert     = "";      // PEM cert; enables in-process TLS
+    std::string tls_key      = "";      // PEM private key
 } cfg;
 
 // ── Structured logging ──────────────────────────────────────────────────────
@@ -109,6 +115,8 @@ static void parse_config(int argc, char **argv) {
         else if (k=="--maxclients")   cfg.max_clients  = atoi(val.c_str());
         else if (k=="--metrics-port") cfg.metrics_port = atoi(val.c_str());
         else if (k=="--loglevel")     cfg.log_level    = atoi(val.c_str());
+        else if (k=="--tls-cert")     cfg.tls_cert     = val;
+        else if (k=="--tls-key")      cfg.tls_key      = val;
         else LOG_W("unknown flag %s (ignored)", k.c_str());
     }
 }
@@ -116,6 +124,40 @@ static void parse_config(int argc, char **argv) {
 // Set by the signal handler; the event loop exits its loop when it flips.
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
+
+// ── In-process TLS (optional; built with `make TLS=1`) ──────────────────────
+//
+// TLS is pinned to 1.3, which removes renegotiation and therefore the
+// SSL_read-wants-write / SSL_write-wants-read inversion — SSL_read only ever
+// wants read, SSL_write only ever wants write. That keeps the integration with
+// the edge-triggered loop tractable and correct.
+#ifdef HAVE_TLS
+static SSL_CTX *g_ssl_ctx = nullptr;
+
+static void tls_init_ctx() {
+    if (cfg.tls_cert.empty()) return;
+    SSL_library_init();
+    SSL_load_error_strings();
+    g_ssl_ctx = SSL_CTX_new(TLS_server_method());
+    if (!g_ssl_ctx) die("SSL_CTX_new");
+    SSL_CTX_set_min_proto_version(g_ssl_ctx, TLS1_3_VERSION);
+    SSL_CTX_set_mode(g_ssl_ctx, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER |
+                                SSL_MODE_ENABLE_PARTIAL_WRITE);
+    if (SSL_CTX_use_certificate_chain_file(g_ssl_ctx, cfg.tls_cert.c_str()) != 1)
+        die("SSL_CTX_use_certificate_chain_file");
+    const char *keyf = cfg.tls_key.empty() ? cfg.tls_cert.c_str()
+                                            : cfg.tls_key.c_str();
+    if (SSL_CTX_use_PrivateKey_file(g_ssl_ctx, keyf, SSL_FILETYPE_PEM) != 1)
+        die("SSL_CTX_use_PrivateKey_file");
+    if (SSL_CTX_check_private_key(g_ssl_ctx) != 1)
+        die("SSL_CTX_check_private_key");
+    LOG_I("in-process TLS 1.3 enabled (cert=%s)", cfg.tls_cert.c_str());
+}
+static bool tls_enabled() { return g_ssl_ctx != nullptr; }
+#else
+static void tls_init_ctx() {}
+static bool tls_enabled() { return false; }
+#endif
 
 const size_t k_max_msg  = 32 << 20;
 // k_max_args + read_u32/read_str/parse_req live in engine/protocol.h so the
@@ -215,6 +257,10 @@ struct Conn {
     DList    idle_node;
     bool     authenticated  = true;   // false until AUTH when requirepass set
     Txn      txn;     // MVCC transaction state (inactive unless BEGIN issued)
+#ifdef HAVE_TLS
+    SSL     *ssl = nullptr;            // non-null on a TLS connection
+    bool     tls_handshaking = false;  // true until SSL_accept completes
+#endif
     // True while a worker thread holds a GetTask for this fd.
     // conn_destroy() defers actual cleanup until the worker posts its result.
     std::atomic<bool> get_pending{false};
@@ -1220,10 +1266,64 @@ static bool try_one_request(Conn *conn) {
 
 // ── I/O handlers (edge-triggered drain loops) ─────────────────────────────────
 
+// read()/write() wrappers that transparently use OpenSSL on a TLS connection.
+// Semantics mirror read()/write(): >0 bytes, 0 = peer closed, -1 with
+// errno==EAGAIN for "would block / want more", -1 otherwise for a fatal error.
+static ssize_t conn_recv(Conn *conn, void *buf, size_t n) {
+#ifdef HAVE_TLS
+    if (conn->ssl) {
+        int r = SSL_read(conn->ssl, buf, (int)n);
+        if (r > 0) return r;
+        int e = SSL_get_error(conn->ssl, r);
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+            errno = EAGAIN; return -1;        // TLS 1.3: only ever WANT_READ
+        }
+        if (e == SSL_ERROR_ZERO_RETURN) return 0;   // clean TLS close
+        errno = EIO; return -1;
+    }
+#endif
+    return read(conn->fd, buf, n);
+}
+
+static ssize_t conn_send(Conn *conn, const void *buf, size_t n) {
+#ifdef HAVE_TLS
+    if (conn->ssl) {
+        int r = SSL_write(conn->ssl, buf, (int)n);
+        if (r > 0) return r;
+        int e = SSL_get_error(conn->ssl, r);
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+            errno = EAGAIN; return -1;        // TLS 1.3: only ever WANT_WRITE
+        }
+        errno = EIO; return -1;
+    }
+#endif
+    return write(conn->fd, buf, n);
+}
+
+#ifdef HAVE_TLS
+// Drive the TLS handshake. Arms the event loop for the direction OpenSSL wants
+// (read vs write) and clears tls_handshaking on success.
+static void tls_advance_handshake(Conn *conn) {
+    int r = SSL_accept(conn->ssl);
+    if (r == 1) {
+        conn->tls_handshaking = false;
+        conn->want_read  = true;
+        conn->want_write = false;
+        return;
+    }
+    int e = SSL_get_error(conn->ssl, r);
+    if (e == SSL_ERROR_WANT_READ)  { conn->want_read = true;  conn->want_write = false; }
+    else if (e == SSL_ERROR_WANT_WRITE) { conn->want_read = false; conn->want_write = true; }
+    else { LOG_D("TLS handshake failed on fd=%d", conn->fd); conn->want_close = true; }
+}
+#endif
+
 static void handle_write(Conn *conn) {
+#ifdef HAVE_TLS
+    if (conn->ssl && conn->tls_handshaking) { tls_advance_handshake(conn); return; }
+#endif
     while (!conn->outgoing.empty()) {
-        ssize_t rv = write(conn->fd,
-                           conn->outgoing.data(), conn->outgoing.size());
+        ssize_t rv = conn_send(conn, conn->outgoing.data(), conn->outgoing.size());
         if (rv < 0 && errno == EAGAIN) break;
         if (rv < 0) { conn->want_close=true; return; }
         buf_consume(conn->outgoing, (size_t)rv);
@@ -1235,9 +1335,17 @@ static void handle_write(Conn *conn) {
 }
 
 static void handle_read(Conn *conn) {
+#ifdef HAVE_TLS
+    if (conn->ssl && conn->tls_handshaking) {
+        tls_advance_handshake(conn);
+        // Fall through only once the handshake completes, to drain any app data
+        // already buffered by OpenSSL (edge-triggered: no second EV_READ fires).
+        if (conn->tls_handshaking || conn->want_close) return;
+    }
+#endif
     uint8_t buf[64*1024];
     while (true) {
-        ssize_t rv = read(conn->fd, buf, sizeof(buf));
+        ssize_t rv = conn_recv(conn, buf, sizeof(buf));
         if (rv < 0 && errno == EAGAIN) break;
         if (rv < 0) { msg_errno("read()"); conn->want_close=true; return; }
         if (rv == 0) { conn->want_close=true; return; }
@@ -1295,6 +1403,15 @@ static void handle_accept(int listen_fd) {
     conn->last_active_ms = get_monotonic_msec();
     dlist_insert_before(&g.idle_list, &conn->idle_node);
 
+#ifdef HAVE_TLS
+    if (tls_enabled()) {
+        conn->ssl = SSL_new(g_ssl_ctx);
+        SSL_set_fd(conn->ssl, connfd);
+        SSL_set_accept_state(conn->ssl);
+        conn->tls_handshaking = true;   // no app I/O until SSL_accept completes
+    }
+#endif
+
     if (g.fd2conn.size() <= (size_t)connfd)
         g.fd2conn.resize(connfd+1);
     assert(!g.fd2conn[connfd]);
@@ -1318,6 +1435,9 @@ static void conn_destroy(Conn *conn) {
         return;
     }
 
+#ifdef HAVE_TLS
+    if (conn->ssl) { SSL_free(conn->ssl); conn->ssl = nullptr; }
+#endif
     close(conn->fd);
     g.fd2conn[conn->fd] = NULL;
     dlist_detach(&conn->idle_node);
@@ -1472,6 +1592,8 @@ int main(int argc, char **argv) {
     sigaction(SIGINT,  &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
+    tls_init_ctx();
+
     dlist_init(&g.idle_list);
     dlist_init(&g.lru_list);
     seqlock_init(&g.rcu);
@@ -1506,10 +1628,11 @@ int main(int argc, char **argv) {
         LOG_I("Prometheus metrics on :%d/metrics", cfg.metrics_port);
     }
 
-    LOG_I("listening on :%d  (kqueue/epoll + WAL + mmap + MVCC%s%s)",
+    LOG_I("listening on :%d  (kqueue/epoll + WAL + mmap + MVCC%s%s%s)",
           cfg.port,
           cfg.requirepass.empty() ? "" : " + auth",
-          cfg.maxmemory ? " + maxmemory" : "");
+          cfg.maxmemory ? " + maxmemory" : "",
+          tls_enabled() ? " + TLS1.3" : "");
 
     // ── Event loop ────────────────────────────────────────────────────────
     ELEvent events[1024];

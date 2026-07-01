@@ -508,6 +508,8 @@ The server is configured via CLI flags (or `KVS_*` env vars); nothing is hard-co
 | `--maxclients <n>` | `KVS_MAXCLIENTS` | `10000` | Reject connections beyond this cap |
 | `--metrics-port <n>` | `KVS_METRICS_PORT` | `0` (off) | Serve Prometheus `/metrics` over HTTP |
 | `--loglevel <0-3>` | `KVS_LOGLEVEL` | `1` (info) | `0`=debug `1`=info `2`=warn `3`=error |
+| `--tls-cert <pem>` | — | *(off)* | PEM cert — enables in-process TLS 1.3 (build with `make kvs TLS=1`) |
+| `--tls-key <pem>` | — | *(cert)* | PEM private key (defaults to the cert file) |
 
 ```bash
 ./kvs --port 6400 --dir /var/lib/kvs --requirepass s3cret \
@@ -525,14 +527,25 @@ The server is configured via CLI flags (or `KVS_*` env vars); nothing is hard-co
 
 ### TLS
 
-TLS is **terminated by a sidecar** ([`deploy/stunnel.conf`](deploy/stunnel.conf)), not compiled into the server — the same approach Redis used before 6.0 and the standard pattern for datastores. This keeps OpenSSL and the non-blocking TLS handshake state machine out of the server's edge-triggered hot path, and lets operations rotate certs and pick ciphers without touching the database. Bind the server to loopback and run stunnel in front:
+Two options — pick per deployment:
+
+**1. In-process TLS 1.3 (OpenSSL)** — build with `make kvs TLS=1` and pass a cert:
+
+```bash
+make kvs TLS=1
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+    -keyout key.pem -out cert.pem -subj "/CN=localhost"
+./kvs --tls-cert cert.pem --tls-key key.pem
+```
+
+TLS is pinned to **1.3**, which removes renegotiation and therefore the `SSL_read`-wants-write / `SSL_write`-wants-read inversion — so `SSL_read` only ever wants read and `SSL_write` only ever wants write, keeping the OpenSSL integration with the edge-triggered loop correct. `conn_recv`/`conn_send` transparently wrap `SSL_read`/`SSL_write`; the handshake is driven non-blocking via `tls_advance_handshake` (arming the event loop for the direction OpenSSL asks for); on handshake completion `handle_read` falls through to drain any app data OpenSSL already buffered (the edge-triggered "no second `EV_READ`" stall). The default (non-TLS) build is dependency-free and the 836K read path is untouched. Verified by `make test-tls` (real TLS 1.3 client, incl. a pipelined batch).
+
+**2. TLS termination via sidecar** ([`deploy/stunnel.conf`](deploy/stunnel.conf)) — the Redis-pre-6.0 pattern; keeps OpenSSL out of the process entirely:
 
 ```bash
 ./kvs --port 1234                 # plaintext on localhost
 stunnel deploy/stunnel.conf       # TLS on :6379 → forwards to :1234
 ```
-
-In-process OpenSSL TLS is a documented future option (see [Production Roadmap](#production-roadmap-what-would-make-this-production-grade)).
 
 ---
 
@@ -653,7 +666,7 @@ The single biggest gap. Real distributed databases replicate the WAL to follower
 Today the whole server runs on **one event-loop thread**, so it saturates a single core. A thread-per-core model (à la ScyllaDB/Seastar or Redis-per-core) would shard connections/keys across N event loops. This is the largest single-node performance lever left; it interacts with the MVCC/seqlock model, so it's a deliberate architectural change, not an add-on.
 
 ### 3. Security & operability — **mostly implemented**
-See [Configuration & Operability](#configuration--operability). Done: **auth** (`--requirepass` + `AUTH`), **max-memory LRU eviction** (`--maxmemory`), **connection limits** (`--maxclients`), **CLI/env config** (port, data-dir, etc.), **graceful shutdown** (`SIGTERM`→flush+checkpoint), **structured logging** (levels), **Prometheus `/metrics`** export, and **tombstone GC**. **TLS** is terminated via an stunnel sidecar ([`deploy/stunnel.conf`](deploy/stunnel.conf)); *in-process OpenSSL TLS* (non-blocking handshake in the event loop) remains the one open item here.
+**Implemented** — see [Configuration & Operability](#configuration--operability): **auth** (`--requirepass` + `AUTH`), **max-memory LRU eviction** (`--maxmemory`), **connection limits** (`--maxclients`), **CLI/env config**, **graceful shutdown** (`SIGTERM`→flush+checkpoint), **structured logging**, **Prometheus `/metrics`**, **tombstone GC**, and **TLS** — both **in-process TLS 1.3** (OpenSSL, `make kvs TLS=1`) and stunnel-sidecar termination.
 
 ### 4. Stronger isolation & full MVCC coverage
 - **Serializable isolation (SSI)** — current level is [snapshot isolation](#per-type-guarantees-honest-scope), which permits write-skew. SSI needs read-set tracking / predicate validation at commit.
@@ -678,7 +691,7 @@ If reads are ever moved back onto worker threads (offload), version-chain prunin
 | Accept bottleneck | One `accept()` per EV_READ | Drain loop — handles burst arrivals |
 | Observability | None | p50/p99/p999 + `INFO` + **Prometheus `/metrics`** |
 | Transactions | None | **MVCC snapshot isolation** — `BEGIN`/`COMMIT`/`ROLLBACK`, write-write conflict detection |
-| Operability | None | CLI/env config, **AUTH**, **maxmemory LRU eviction**, connection limits, graceful shutdown, tombstone GC, structured logging, TLS (stunnel) |
+| Operability | None | CLI/env config, **AUTH**, **maxmemory LRU eviction**, connection limits, graceful shutdown, tombstone GC, structured logging, **in-process TLS 1.3** + stunnel |
 | Commands | SET / GET / DEL / ZADD / etc. | Same + WAL-logged + snapshot-backed |
 
 **Throughput headroom:** At pipeline=64, `kvs` reaches ~836k GET ops/s (and ~396k ops/s under an 80/20 mixed workload) on a single loopback connection on a laptop — median of 7 runs, see [Benchmark Results](#benchmark-results). These are single-connection loopback figures, not networked throughput; they rose 6.4× / 3.4× after the inline-GET and WAL group-commit optimizations. On a server-class machine with real network and many connections, the kqueue/epoll model eliminates the O(N) poll bottleneck and scales across connections rather than relying on deeper pipelining of one connection.

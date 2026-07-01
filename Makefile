@@ -37,8 +37,19 @@ ENGINE_HDRS := engine/event_loop.h engine/wal.h engine/mmap_store.h engine/rcu.h
                core/common.h core/hashtable.h core/avl.h \
                core/zset.h core/list.h core/heap.h core/thread_pool.h
 
+# In-process TLS (opt-in: `make kvs TLS=1`). Requires OpenSSL. On macOS the
+# Homebrew prefix is auto-detected; override with OPENSSL_PREFIX=/path if needed.
+TLS ?= 0
+TLS_FLAGS :=
+TLS_LIBS  :=
+ifeq ($(TLS),1)
+    OPENSSL_PREFIX ?= $(shell brew --prefix openssl@3 2>/dev/null)
+    TLS_FLAGS := -DHAVE_TLS $(if $(OPENSSL_PREFIX),-I$(OPENSSL_PREFIX)/include)
+    TLS_LIBS  := $(if $(OPENSSL_PREFIX),-L$(OPENSSL_PREFIX)/lib) -lssl -lcrypto
+endif
+
 kvs: $(ENGINE_SRCS) $(ENGINE_HDRS)
-	$(CXX) $(CXXFLAGS) -Icore -o $@ $(ENGINE_SRCS) $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) $(TLS_FLAGS) -Icore -o $@ $(ENGINE_SRCS) $(LDFLAGS) $(TLS_LIBS)
 
 # ── GPU support (opt-in: make bench GPU=1) ────────────────────────────────────
 
@@ -87,6 +98,13 @@ test: $(TEST_BIN) tests/fuzz_parser kvs
 	@set -e; for t in $(TEST_BIN); do echo "── $$t ──"; ./$$t; done
 	@echo "── tests/fuzz_parser ──"; ./tests/fuzz_parser
 	@echo "── tests/test_integration.py ──"; python3 tests/test_integration.py
+
+# In-process TLS smoke test: builds a TLS server and drives it with a real
+# TLS 1.3 client. Separate from `make test` so the default suite / CI need no
+# OpenSSL. Requires OpenSSL (server) + `openssl` CLI (cert generation).
+test-tls:
+	$(MAKE) kvs TLS=1
+	python3 tests/test_tls.py
 
 # Coverage-guided libFuzzer build (requires clang shipping libFuzzer, e.g.
 # Linux). Runs a 60s campaign. Not part of `make test` (toolchain-dependent).
