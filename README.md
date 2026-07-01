@@ -595,6 +595,37 @@ String values now live in immutable [MVCC version chains](#mvcc--multi-version-c
 
 ---
 
+## Production Roadmap (what would make this production-grade)
+
+This is a from-scratch **single-node storage engine** that implements production *techniques* (WAL, group commit, crash recovery, seqlock reads, MVCC snapshot isolation, fuzzed parser, observability) — not a production database. The gap to a production system, in rough priority order:
+
+### 1. Distribution — replication, failover, sharding
+The single biggest gap. Real distributed databases replicate the WAL to followers (leader/follower log shipping), elect a new leader on failure (Raft/Paxos), and shard the keyspace across nodes. A natural first step here is async leader→follower WAL streaming, since the WAL already exists.
+
+### 2. Multi-core — sharded event loops (thread-per-core)
+Today the whole server runs on **one event-loop thread**, so it saturates a single core. A thread-per-core model (à la ScyllaDB/Seastar or Redis-per-core) would shard connections/keys across N event loops. This is the largest single-node performance lever left; it interacts with the MVCC/seqlock model, so it's a deliberate architectural change, not an add-on.
+
+### 3. Security & operability
+The commodity "make it deployable" work, mostly independent and incremental:
+- **Auth** (e.g. `AUTH`/password or token) and **TLS** for the wire protocol.
+- **Max-memory + eviction policy** (LRU/LFU/random) so the server is bounded under memory pressure.
+- **Connection limits / backpressure / per-request quotas** to survive abusive clients.
+- **Config file / CLI flags** (currently port and paths are hard-coded to `:1234`, `redis.dat`, `redis.wal`).
+- **Graceful shutdown & signal handling** — flush WAL, checkpoint, close connections on `SIGTERM`.
+- **Structured logging** with levels, and **metrics export** (Prometheus/OpenMetrics scrape endpoint building on the existing `INFO` counters).
+
+### 4. Stronger isolation & full MVCC coverage
+- **Serializable isolation (SSI)** — current level is [snapshot isolation](#per-type-guarantees-honest-scope), which permits write-skew. SSI needs read-set tracking / predicate validation at commit.
+- **Versioned sorted sets** — `ZADD`/`ZREM` are transactional for *atomicity* but not snapshot-isolated for reads, because the AVL structure isn't versioned. True SI for zsets means MVCC per member.
+
+### 5. Version & tombstone garbage collection
+Old *versions* are pruned, but a fully-deleted key's tombstone `Entry` lingers in the hash map forever. A background/opportunistic sweep should physically remove entries whose newest version is a tombstone older than the oldest live snapshot, reclaiming that memory.
+
+### 6. Hardening the concurrent-read path
+If reads are ever moved back onto worker threads (offload), version-chain pruning needs epoch-based reclamation or hazard pointers to be safe against concurrent readers (see [#6 above](#6-seqlock-rcu--version-copy-safety)).
+
+---
+
 ## Project Impact
 
 | Dimension | v14 (first gen) | v15 (production gen) |
