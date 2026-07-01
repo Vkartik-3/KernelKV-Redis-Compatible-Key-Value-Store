@@ -13,6 +13,8 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
+#include <signal.h>
+#include <stdarg.h>
 // C++
 #include <string>
 #include <vector>
@@ -52,6 +54,68 @@ static void fd_set_nb(int fd) {
     if (flags < 0) die("fcntl F_GETFL");
     if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) die("fcntl F_SETFL");
 }
+
+// ── Configuration (CLI flags + env vars) ────────────────────────────────────
+
+static struct Config {
+    int         port         = 1234;
+    std::string data_dir     = ".";     // directory for redis.dat / redis.wal
+    std::string requirepass  = "";      // empty = auth disabled
+    uint64_t    maxmemory    = 0;       // bytes; 0 = unlimited
+    int         max_clients  = 10000;   // reject connections beyond this
+    int         metrics_port = 0;       // Prometheus /metrics; 0 = disabled
+    int         log_level    = 1;       // 0=debug 1=info 2=warn 3=error
+} cfg;
+
+// ── Structured logging ──────────────────────────────────────────────────────
+
+enum { LOG_DEBUG = 0, LOG_INFO = 1, LOG_WARN = 2, LOG_ERROR = 3 };
+static const char *k_log_names[] = {"DEBUG", "INFO", "WARN", "ERROR"};
+
+static void log_msg(int level, const char *fmt, ...) {
+    if (level < cfg.log_level) return;
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm; localtime_r(&ts.tv_sec, &tm);
+    char when[32];
+    strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", &tm);
+    fprintf(stderr, "%s.%03ld [%s] ", when, ts.tv_nsec / 1000000, k_log_names[level]);
+    va_list ap; va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+#define LOG_D(...) log_msg(LOG_DEBUG, __VA_ARGS__)
+#define LOG_I(...) log_msg(LOG_INFO,  __VA_ARGS__)
+#define LOG_W(...) log_msg(LOG_WARN,  __VA_ARGS__)
+#define LOG_E(...) log_msg(LOG_ERROR, __VA_ARGS__)
+
+// Parse `--flag value` pairs (with KVS_* env fallbacks). Unknown flags warn.
+static void parse_config(int argc, char **argv) {
+    auto env = [](const char *k) -> const char* { return getenv(k); };
+    if (const char *v = env("KVS_PORT"))        cfg.port         = atoi(v);
+    if (const char *v = env("KVS_DIR"))         cfg.data_dir     = v;
+    if (const char *v = env("KVS_REQUIREPASS")) cfg.requirepass  = v;
+    if (const char *v = env("KVS_MAXMEMORY"))   cfg.maxmemory    = strtoull(v,0,10);
+    if (const char *v = env("KVS_MAXCLIENTS"))  cfg.max_clients  = atoi(v);
+    if (const char *v = env("KVS_METRICS_PORT"))cfg.metrics_port = atoi(v);
+    if (const char *v = env("KVS_LOGLEVEL"))    cfg.log_level    = atoi(v);
+    for (int i = 1; i + 1 < argc; i += 2) {
+        std::string k = argv[i], val = argv[i+1];
+        if      (k=="--port")         cfg.port         = atoi(val.c_str());
+        else if (k=="--dir")          cfg.data_dir     = val;
+        else if (k=="--requirepass")  cfg.requirepass  = val;
+        else if (k=="--maxmemory")    cfg.maxmemory    = strtoull(val.c_str(),0,10);
+        else if (k=="--maxclients")   cfg.max_clients  = atoi(val.c_str());
+        else if (k=="--metrics-port") cfg.metrics_port = atoi(val.c_str());
+        else if (k=="--loglevel")     cfg.log_level    = atoi(val.c_str());
+        else LOG_W("unknown flag %s (ignored)", k.c_str());
+    }
+}
+
+// Set by the signal handler; the event loop exits its loop when it flips.
+static volatile sig_atomic_t g_stop = 0;
+static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
 const size_t k_max_msg  = 32 << 20;
 // k_max_args + read_u32/read_str/parse_req live in engine/protocol.h so the
@@ -149,6 +213,7 @@ struct Conn {
     Buffer outgoing;
     uint64_t last_active_ms = 0;
     DList    idle_node;
+    bool     authenticated  = true;   // false until AUTH when requirepass set
     Txn      txn;     // MVCC transaction state (inactive unless BEGIN issued)
     // True while a worker thread holds a GetTask for this fd.
     // conn_destroy() defers actual cleanup until the worker posts its result.
@@ -179,6 +244,9 @@ struct Entry {
     uint32_t type    = 0;
     Version *vhead   = nullptr;   // T_STR: version chain (newest first)
     ZSet    zset;                 // T_ZSET
+    DList   lru_node;             // position in g.lru_list (T_STR only)
+    bool    in_lru   = false;
+    uint64_t mem     = 0;         // approx bytes accounted for this entry
 };
 
 struct LookupKey { HNode node; std::string key; };
@@ -222,6 +290,14 @@ static struct {
     // ── MVCC ───────────────────────────────────────────────────────────────
     uint64_t                 clock = 0;        // last assigned commit timestamp
     std::multiset<uint64_t>  active_snaps;     // read_ts of in-flight transactions
+
+    // ── Operability ────────────────────────────────────────────────────────
+    int      metrics_fd = -1;      // Prometheus listener (-1 = disabled)
+    DList    lru_list;             // string entries in LRU order (front = MRU)
+    uint64_t mem_used   = 0;       // approx bytes of live string key+value data
+    uint64_t stat_evictions = 0;   // keys evicted under maxmemory
+    uint64_t stat_expired   = 0;   // keys removed by TTL
+    uint64_t stat_gc_reaped = 0;   // tombstone entries reclaimed by GC
 } g;
 
 static const uint64_t k_ckpt_ops = 1000;
@@ -497,6 +573,67 @@ static void maybe_checkpoint() {
 }
 
 
+// ── LRU tracking, memory accounting, eviction & tombstone GC ────────────────
+
+// Recompute an entry's accounted bytes (key + newest visible value) and fold
+// the delta into the global total.
+static void mem_reaccount(Entry *ent) {
+    uint64_t now = ent->key.size();
+    Version *v = mvcc_visible(ent, g.clock);
+    if (v && !v->deleted) now += v->value.size();
+    g.mem_used -= ent->mem;
+    ent->mem = now;
+    g.mem_used += now;
+}
+
+// Move a string entry to the most-recently-used end of the LRU list. With this
+// sentinel list, insert-before-sentinel places the node at `.prev` (the MRU
+// end), so the least-recently-used entry is always at `g.lru_list.next`.
+static void lru_touch(Entry *ent) {
+    if (ent->type != T_STR) return;
+    if (ent->in_lru) dlist_detach(&ent->lru_node);
+    dlist_insert_before(&g.lru_list, &ent->lru_node);   // MRU end (.prev)
+    ent->in_lru = true;
+}
+
+static void lru_untrack(Entry *ent) {
+    if (ent->in_lru) { dlist_detach(&ent->lru_node); ent->in_lru = false; }
+    g.mem_used -= ent->mem; ent->mem = 0;
+}
+
+// Physically remove a string entry from the keyspace (used by GC + eviction).
+static void reap_entry(Entry *ent) {
+    lru_untrack(ent);
+    hm_delete(&g.db, &ent->node, &entry_eq);
+    entry_set_ttl(ent, -1);
+    mvcc_free_chain(ent);
+    delete ent;
+}
+
+// Tombstone GC: if a key's newest version is a delete that no live snapshot can
+// still see, the entry is invisible to everyone — reclaim it from the hash map.
+static bool gc_reapable(Entry *ent) {
+    if (ent->type != T_STR || !ent->vhead) return false;
+    return ent->vhead->deleted && ent->vhead->commit_ts <= mvcc_min_active();
+}
+
+// Enforce maxmemory by evicting least-recently-used string keys. Skips keys a
+// live transaction snapshot might still need (never breaks snapshot isolation).
+static void maybe_evict() {
+    if (!cfg.maxmemory) return;
+    uint64_t floor = mvcc_min_active();
+    int guard = 0;
+    while (g.mem_used > cfg.maxmemory && !dlist_empty(&g.lru_list) && guard++ < 100000) {
+        Entry *lru = container_of(g.lru_list.next, Entry, lru_node);  // LRU end (.next)
+        // Only evict keys fully visible-as-committed to every live snapshot.
+        if (lru->vhead && lru->vhead->commit_ts > floor) break;
+        LOG_D("evicting key '%s' (maxmemory)", lru->key.c_str());
+        reap_entry(lru);
+        g.stat_evictions++;
+    }
+}
+
+
 // ── Command helpers ───────────────────────────────────────────────────────────
 
 static bool str2int(const std::string &s, int64_t &out) {
@@ -556,6 +693,9 @@ static bool apply_write(const std::string &key, uint64_t commit_ts,
         else { wal_append(&g.wal, WAL_SET, {key, value}); mmap_set(&g.mstore, key, value); }
     }
     mvcc_push(ent, commit_ts, deleted, std::move(value));
+    // LRU + memory accounting; evict if over the configured budget.
+    if (deleted) { lru_untrack(ent); }
+    else { lru_touch(ent); mem_reaccount(ent); if (!g.replaying) maybe_evict(); }
     return true;
 }
 
@@ -855,36 +995,75 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer &out) {
 
 // INFO — return server metrics as a newline-delimited key:value text blob,
 // mirroring the shape of Redis INFO. Read-only; safe to poll for monitoring.
+// Render metrics into `buf`. If `prom` is set, emit Prometheus text-exposition
+// format (# TYPE lines + kvs_<name> <value>); otherwise Redis-style key:value.
+static int fill_metrics(char *buf, size_t cap, bool prom) {
+    uint64_t up = (get_monotonic_msec() - g.stat_start_ms) / 1000;
+    struct M { const char *name, *type; unsigned long long val; };
+    M m[] = {
+        {"uptime_seconds",        "gauge",   (unsigned long long)up},
+        {"connections_received",  "counter", g.stat_conns_total},
+        {"connections_active",    "gauge",   g.stat_conns_active},
+        {"commands_processed",    "counter", g.stat_commands_total},
+        {"reads",                 "counter", g.stat_reads},
+        {"writes",                "counter", g.stat_writes},
+        {"keyspace_keys",         "gauge",   (unsigned long long)hm_size(&g.db)},
+        {"memory_used_bytes",     "gauge",   g.mem_used},
+        {"maxmemory_bytes",       "gauge",   cfg.maxmemory},
+        {"evicted_keys",          "counter", g.stat_evictions},
+        {"expired_keys",          "counter", g.stat_expired},
+        {"gc_reaped_tombstones",  "counter", g.stat_gc_reaped},
+        {"wal_records",           "counter", g.wal.records},
+        {"wal_syncs",             "counter", g.wal.syncs},
+        {"wal_bytes",             "gauge",   g.wal.file_size},
+    };
+    int off = 0;
+    for (const M &e : m) {
+        if (prom)
+            off += snprintf(buf+off, cap-off,
+                "# TYPE kvs_%s %s\nkvs_%s %llu\n", e.name, e.type, e.name, e.val);
+        else
+            off += snprintf(buf+off, cap-off, "%s:%llu\r\n", e.name, e.val);
+        if (off >= (int)cap) break;
+    }
+    return off < 0 ? 0 : off;
+}
+
+// INFO — server metrics as newline-delimited key:value text (Redis-style).
 static void do_info(Buffer &out) {
-    uint64_t uptime_ms = get_monotonic_msec() - g.stat_start_ms;
-    char buf[768];
-    int n = snprintf(buf, sizeof(buf),
-        "uptime_seconds:%llu\r\n"
-        "connections_received:%llu\r\n"
-        "connections_active:%llu\r\n"
-        "commands_processed:%llu\r\n"
-        "reads:%llu\r\n"
-        "writes:%llu\r\n"
-        "keyspace_keys:%zu\r\n"
-        "wal_records:%llu\r\n"
-        "wal_syncs:%llu\r\n"
-        "wal_bytes:%llu\r\n",
-        (unsigned long long)(uptime_ms / 1000),
-        (unsigned long long)g.stat_conns_total,
-        (unsigned long long)g.stat_conns_active,
-        (unsigned long long)g.stat_commands_total,
-        (unsigned long long)g.stat_reads,
-        (unsigned long long)g.stat_writes,
-        hm_size(&g.db),
-        (unsigned long long)g.wal.records,
-        (unsigned long long)g.wal.syncs,
-        (unsigned long long)g.wal.file_size);
-    if (n < 0) n = 0;
+    char buf[1536];
+    int n = fill_metrics(buf, sizeof(buf), false);
     out_str(out, buf, (size_t)n);
 }
 
+// Serve one Prometheus scrape: accept, read+discard the HTTP request, reply
+// with 200 + text-exposition metrics, close. Synchronous — scrapes are rare
+// and tiny, so this never contends with the KV hot path.
+static void serve_metrics(int listen_fd) {
+    while (true) {
+        int c = accept(listen_fd, NULL, NULL);
+        if (c < 0) break;                       // backlog drained
+        char req[2048];
+        (void)!read(c, req, sizeof(req));       // consume request line/headers
+        char body[1536];
+        int blen = fill_metrics(body, sizeof(body), true);
+        char resp[2048];
+        int rlen = snprintf(resp, sizeof(resp),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain; version=0.0.4\r\n"
+            "Content-Length: %d\r\n\r\n", blen);
+        (void)!write(c, resp, rlen);
+        (void)!write(c, body, blen);
+        close(c);
+    }
+}
+
 static void do_request(Conn *conn, std::vector<std::string> &cmd, Buffer &out) {
-    if      (cmd.size()==1 && cmd[0]=="info")     do_info(out);
+    if      (cmd.size()==2 && cmd[0]=="auth") {   // already authed (gate passed)
+        out_str(out, cfg.requirepass.empty() ? "OK (no auth required)" : "OK",
+                cfg.requirepass.empty() ? 20 : 2);
+    }
+    else if (cmd.size()==1 && cmd[0]=="info")     do_info(out);
     else if (cmd.size()==2 && cmd[0]=="get")      do_get(conn,cmd,out);
     else if (cmd.size()==3 && cmd[0]=="set")      do_set(conn,cmd,out);
     else if (cmd.size()==2 && cmd[0]=="del")      do_del(conn,cmd,out);
@@ -999,6 +1178,21 @@ static bool try_one_request(Conn *conn) {
         conn->want_close=true; return false;
     }
 
+    // ── AUTH gate: until authenticated, only AUTH is accepted ─────────────
+    if (!conn->authenticated) {
+        size_t hdr; response_begin(conn->outgoing, &hdr);
+        if (cmd.size()==2 && cmd[0]=="auth") {
+            if (cmd[1] == cfg.requirepass) { conn->authenticated = true;
+                                             out_str(conn->outgoing, "OK", 2); }
+            else out_err(conn->outgoing, ERR_UNKNOWN, "ERR invalid password");
+        } else {
+            out_err(conn->outgoing, ERR_UNKNOWN, "NOAUTH authentication required");
+        }
+        response_end(conn->outgoing, hdr);
+        buf_consume(conn->incoming, 4+len);
+        return true;
+    }
+
     // ── Observability: classify and count the request ─────────────────────
     g.stat_commands_total++;
     bool is_write = !cmd.empty() &&
@@ -1081,16 +1275,23 @@ static void handle_accept(int listen_fd) {
         msg_errno("accept()"); return;
     }
 
+    // Backpressure: reject connections beyond the configured cap.
+    if ((int)g.stat_conns_active >= cfg.max_clients) {
+        LOG_W("connection limit %d reached — rejecting new client", cfg.max_clients);
+        close(connfd);
+        continue;
+    }
+
     uint32_t ip = client_addr.sin_addr.s_addr;
-    fprintf(stderr, "new client %u.%u.%u.%u:%u\n",
-            ip&255,(ip>>8)&255,(ip>>16)&255,ip>>24,
-            ntohs(client_addr.sin_port));
+    LOG_D("new client %u.%u.%u.%u:%u",
+          ip&255,(ip>>8)&255,(ip>>16)&255,ip>>24, ntohs(client_addr.sin_port));
 
     fd_set_nb(connfd);
 
     Conn *conn = new Conn();
     conn->fd             = connfd;
     conn->want_read      = true;
+    conn->authenticated  = cfg.requirepass.empty();   // auth off ⇒ pre-authed
     conn->last_active_ms = get_monotonic_msec();
     dlist_insert_before(&g.idle_list, &conn->idle_node);
 
@@ -1144,12 +1345,32 @@ static int32_t next_timer_ms() {
 
 static bool hnode_same(HNode *a, HNode *b) { return a==b; }
 
+// Reclaim a bounded batch of dead tombstone entries (keys whose newest version
+// is a delete no live snapshot can still see). Runs each timer tick, bounded so
+// it never stalls the event loop on a large keyspace.
+static bool cb_gc(HNode *node, void *arg) {
+    auto *dead = (std::vector<Entry*>*)arg;
+    Entry *ent = container_of(node, Entry, node);
+    if (gc_reapable(ent) && dead->size() < 256) dead->push_back(ent);
+    return true;
+}
+static void gc_sweep() {
+    // Throttle: a full keyspace scan is O(N), so run at most ~1×/sec.
+    static uint64_t last_gc_ms = 0;
+    uint64_t now = get_monotonic_msec();
+    if (now - last_gc_ms < 1000) return;
+    last_gc_ms = now;
+    std::vector<Entry*> dead;
+    hm_foreach(&g.db, &cb_gc, &dead);
+    for (Entry *e : dead) { reap_entry(e); g.stat_gc_reaped++; }
+}
+
 static void process_timers() {
     uint64_t now = get_monotonic_msec();
     while (!dlist_empty(&g.idle_list)) {
         Conn *c = container_of(g.idle_list.next, Conn, idle_node);
         if (c->last_active_ms + k_idle_timeout_ms >= now) break;
-        fprintf(stderr,"idle timeout fd=%d\n",c->fd);
+        LOG_D("idle timeout fd=%d", c->fd);
         conn_destroy(c);
     }
     const size_t k_max_works = 2000;
@@ -1158,9 +1379,13 @@ static void process_timers() {
         Entry *ent = container_of(g.heap[0].ref, Entry, heap_idx);
         HNode *node = hm_delete(&g.db, &ent->node, &hnode_same);
         assert(node == &ent->node);
+        if (ent->in_lru) { dlist_detach(&ent->lru_node); ent->in_lru=false; }
+        g.mem_used -= ent->mem;
         entry_del(ent);
+        g.stat_expired++;
         if (++nworks >= k_max_works) break;
     }
+    gc_sweep();
 }
 
 
@@ -1209,8 +1434,46 @@ static void mmap_replay(const std::string &key, const std::string &val) {
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
-int main() {
+// Open a non-blocking listening socket on `port` (INADDR_ANY).
+static int listen_on(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) die("socket()");
+    int val = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
+    struct sockaddr_in addr = {};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = ntohs((uint16_t)port);
+    addr.sin_addr.s_addr = ntohl(0);
+    if (bind(fd, (const sockaddr*)&addr, sizeof(addr))) die("bind()");
+    fd_set_nb(fd);
+    if (listen(fd, SOMAXCONN)) die("listen()");
+    return fd;
+}
+
+// Flush and checkpoint on the way out so a graceful stop loses no acked data.
+static void graceful_shutdown() {
+    LOG_I("shutting down: syncing WAL and checkpointing snapshot");
+    wal_sync(&g.wal);
+    mmap_compact(&g.mstore, [](MMapStore *ms) {
+        hm_foreach(&g.db, &cb_snapshot, ms);
+    });
+    wal_checkpoint(&g.wal);
+    if (g.listen_fd >= 0) close(g.listen_fd);
+    LOG_I("shutdown complete");
+}
+
+int main(int argc, char **argv) {
+    parse_config(argc, argv);
+
+    // Graceful shutdown on SIGTERM/SIGINT; ignore SIGPIPE (dead peer writes).
+    struct sigaction sa = {};
+    sa.sa_handler = on_signal;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT,  &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+
     dlist_init(&g.idle_list);
+    dlist_init(&g.lru_list);
     seqlock_init(&g.rcu);
     thread_pool_init(&g.thread_pool, 4);
     el_init(&g.el);
@@ -1221,40 +1484,39 @@ int main() {
     fd_set_nb(g.wakeup_pipe[0]);   // non-blocking so drain_results() won't stall
     fd_set_nb(g.wakeup_pipe[1]);   // non-blocking so workers never block on write
 
-    // ── Restore state from disk ───────────────────────────────────────────
+    // ── Restore state from disk (paths relative to data_dir) ──────────────
+    std::string dat = cfg.data_dir + "/redis.dat";
+    std::string wal = cfg.data_dir + "/redis.wal";
     g.stat_start_ms = get_monotonic_msec();
     g.replaying = true;
-    mmap_open(&g.mstore, "redis.dat", mmap_replay);
-    wal_open(&g.wal, "redis.wal", wal_replay);
+    mmap_open(&g.mstore, dat.c_str(), mmap_replay);
+    wal_open(&g.wal, wal.c_str(), wal_replay);
     g.replaying = false;
-    fprintf(stderr, "restored %zu keys from snapshot + WAL\n", hm_size(&g.db));
+    LOG_I("restored %zu keys from snapshot + WAL (dir=%s)",
+          hm_size(&g.db), cfg.data_dir.c_str());
 
-    // ── Listening socket ──────────────────────────────────────────────────
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) die("socket()");
-    int val = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
-    struct sockaddr_in addr = {};
-    addr.sin_family      = AF_INET;
-    addr.sin_port        = ntohs(1234);
-    addr.sin_addr.s_addr = ntohl(0);
-    if (bind(fd, (const sockaddr*)&addr, sizeof(addr))) die("bind()");
-    fd_set_nb(fd);
-    if (listen(fd, SOMAXCONN)) die("listen()");
-    g.listen_fd = fd;
-
-    // Register the listen fd and the wakeup pipe read end with the event loop.
-    el_add(&g.el, fd, EV_READ, (void*)(intptr_t)fd);
+    // ── Listening socket(s) ───────────────────────────────────────────────
+    g.listen_fd = listen_on(cfg.port);
+    el_add(&g.el, g.listen_fd, EV_READ, (void*)(intptr_t)g.listen_fd);
     el_add(&g.el, g.wakeup_pipe[0], EV_READ, (void*)(intptr_t)g.wakeup_pipe[0]);
 
-    fprintf(stderr,
-            "listening on :1234  (kqueue/epoll + WAL + mmap + MT-GET)\n");
+    if (cfg.metrics_port > 0) {
+        g.metrics_fd = listen_on(cfg.metrics_port);
+        el_add(&g.el, g.metrics_fd, EV_READ, (void*)(intptr_t)g.metrics_fd);
+        LOG_I("Prometheus metrics on :%d/metrics", cfg.metrics_port);
+    }
+
+    LOG_I("listening on :%d  (kqueue/epoll + WAL + mmap + MVCC%s%s)",
+          cfg.port,
+          cfg.requirepass.empty() ? "" : " + auth",
+          cfg.maxmemory ? " + maxmemory" : "");
 
     // ── Event loop ────────────────────────────────────────────────────────
     ELEvent events[1024];
-    while (true) {
+    while (!g_stop) {
         int32_t timeout_ms = next_timer_ms();
         int n = el_wait(&g.el, events, 1024, timeout_ms);
+        if (n < 0) continue;   // EINTR from a signal — re-check g_stop
 
         for (int i = 0; i < n; i++) {
             int efd = (int)(intptr_t)events[i].data;
@@ -1268,6 +1530,11 @@ int main() {
 
             if (efd == g.listen_fd) {
                 handle_accept(g.listen_fd);
+                continue;
+            }
+
+            if (g.metrics_fd >= 0 && efd == g.metrics_fd) {
+                serve_metrics(g.metrics_fd);
                 continue;
             }
 
@@ -1294,5 +1561,7 @@ int main() {
 
         process_timers();
     }
+
+    graceful_shutdown();
     return 0;
 }

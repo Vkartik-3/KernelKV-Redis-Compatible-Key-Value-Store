@@ -346,7 +346,7 @@ make test
 # ── tests/test_zset ──        PASSED: 21 checks, 0 failed
 # ── tests/test_wal ──         PASSED: 16 checks, 0 failed
 # ── tests/fuzz_parser ──      PASSED: correctness + ~50k fuzz iterations, 0 failed
-# ── tests/test_integration ── PASSED: 62 checks, 0 failed
+# ── tests/test_integration ── PASSED: 74 checks, 0 failed
 ```
 
 ### Fuzzing & input hardening
@@ -362,23 +362,28 @@ This exercise also **hardened the parser**: the bounds checks now compare a leng
 
 ## Observability
 
-The server exposes runtime metrics via an `INFO` command (Redis-style newline-delimited `key:value` text), so throughput, keyspace size, and the write path can be monitored without a debugger or restart. Counters live on the single event-loop thread, so they're race-free and add no locking to the hot path.
+The server exposes runtime metrics two ways — an in-band **`INFO` command** (Redis-style `key:value` text) and an out-of-band **Prometheus `/metrics` HTTP endpoint** (`--metrics-port`). Counters live on the single event-loop thread, so they're race-free and add no locking to the hot path.
 
 ```text
-$ redis-style INFO →
-uptime_seconds:42
-connections_received:8
-connections_active:3
-commands_processed:1048576
-reads:838861
-writes:209715
-keyspace_keys:50000
+$ INFO →                          $ curl :9400/metrics →
+uptime_seconds:42                 # TYPE kvs_commands_processed counter
+connections_received:8            kvs_commands_processed 1048576
+connections_active:3              # TYPE kvs_writes counter
+commands_processed:1048576        kvs_writes 209715
+reads:838861                      # TYPE kvs_evicted_keys counter
+writes:209715                     kvs_evicted_keys 128
+keyspace_keys:50000               # TYPE kvs_wal_syncs counter
+memory_used_bytes:5242880         kvs_wal_syncs 16104
+maxmemory_bytes:0                 ...
+evicted_keys:128
+expired_keys:34
+gc_reaped_tombstones:512
 wal_records:209715
 wal_syncs:16104        ← group commit: ~13× fewer fsyncs than writes
 wal_bytes:5242880
 ```
 
-The `wal_records` vs `wal_syncs` pair makes [WAL group commit](#optimization-2--wal-group-commit-the-write-path-unlock) directly observable: under pipelined writes the fsync count stays far below the record count. The integration suite asserts this invariant (`test_info_group_commit`).
+The `wal_records` vs `wal_syncs` pair makes [WAL group commit](#optimization-2--wal-group-commit-the-write-path-unlock) directly observable: under pipelined writes the fsync count stays far below the record count. The integration suite asserts this invariant (`test_info_group_commit`) and scrapes the Prometheus endpoint (`test_metrics_endpoint`).
 
 ---
 
@@ -486,6 +491,48 @@ Tags: 0=nil  1=err  2=str  3=int  4=dbl  5=arr
 | `begin` | 1 | str (`OK`) — start an MVCC transaction |
 | `commit` | 1 | str (`OK`) or err on write-write conflict |
 | `rollback` | 1 | str (`OK`) — discard buffered writes |
+| `auth <password>` | 2 | str (`OK`) or err — required first when `--requirepass` is set |
+
+---
+
+## Configuration & Operability
+
+The server is configured via CLI flags (or `KVS_*` env vars); nothing is hard-coded. All are optional.
+
+| Flag | Env | Default | Purpose |
+|---|---|---|---|
+| `--port <n>` | `KVS_PORT` | `1234` | Listen port |
+| `--dir <path>` | `KVS_DIR` | `.` | Directory for `redis.dat` / `redis.wal` |
+| `--requirepass <pw>` | `KVS_REQUIREPASS` | *(off)* | Require `AUTH <pw>` before any command |
+| `--maxmemory <bytes>` | `KVS_MAXMEMORY` | `0` (unlimited) | Evict LRU string keys above this budget |
+| `--maxclients <n>` | `KVS_MAXCLIENTS` | `10000` | Reject connections beyond this cap |
+| `--metrics-port <n>` | `KVS_METRICS_PORT` | `0` (off) | Serve Prometheus `/metrics` over HTTP |
+| `--loglevel <0-3>` | `KVS_LOGLEVEL` | `1` (info) | `0`=debug `1`=info `2`=warn `3`=error |
+
+```bash
+./kvs --port 6400 --dir /var/lib/kvs --requirepass s3cret \
+      --maxmemory 268435456 --metrics-port 9400 --loglevel 1
+```
+
+**What each feature does:**
+
+- **Auth** — with `--requirepass`, every connection is gated: until it sends `AUTH <pw>`, all commands return `NOAUTH authentication required`. The gate sits in `try_one_request` so it also covers the inline-GET fast path.
+- **Max-memory + LRU eviction** — string entries are tracked in an O(1) intrusive LRU list; when approximate live memory exceeds `--maxmemory`, the least-recently-*written* keys are evicted (never keys a live transaction snapshot still needs, so eviction can't break snapshot isolation). Reads deliberately don't touch the LRU, to keep the 836K-ops/s read path free of bookkeeping. `evicted_keys` is exported.
+- **Connection limits / backpressure** — `handle_accept` rejects (immediately closes) connections beyond `--maxclients`.
+- **Graceful shutdown** — `SIGTERM`/`SIGINT` set a flag; the event loop exits cleanly, `wal_sync`s, checkpoints the snapshot, and closes the listener — so a clean stop loses no acked data. `SIGPIPE` is ignored.
+- **Tombstone GC** — a throttled (~1/sec, bounded-batch) sweep physically reclaims `Entry` objects whose newest version is a delete no live snapshot can still see, so deleted keys don't leak memory. `gc_reaped_tombstones` is exported.
+- **Structured logging** — timestamped, level-prefixed (`DEBUG`/`INFO`/`WARN`/`ERROR`), filtered by `--loglevel`.
+
+### TLS
+
+TLS is **terminated by a sidecar** ([`deploy/stunnel.conf`](deploy/stunnel.conf)), not compiled into the server — the same approach Redis used before 6.0 and the standard pattern for datastores. This keeps OpenSSL and the non-blocking TLS handshake state machine out of the server's edge-triggered hot path, and lets operations rotate certs and pick ciphers without touching the database. Bind the server to loopback and run stunnel in front:
+
+```bash
+./kvs --port 1234                 # plaintext on localhost
+stunnel deploy/stunnel.conf       # TLS on :6379 → forwards to :1234
+```
+
+In-process OpenSSL TLS is a documented future option (see [Production Roadmap](#production-roadmap-what-would-make-this-production-grade)).
 
 ---
 
@@ -605,21 +652,15 @@ The single biggest gap. Real distributed databases replicate the WAL to follower
 ### 2. Multi-core — sharded event loops (thread-per-core)
 Today the whole server runs on **one event-loop thread**, so it saturates a single core. A thread-per-core model (à la ScyllaDB/Seastar or Redis-per-core) would shard connections/keys across N event loops. This is the largest single-node performance lever left; it interacts with the MVCC/seqlock model, so it's a deliberate architectural change, not an add-on.
 
-### 3. Security & operability
-The commodity "make it deployable" work, mostly independent and incremental:
-- **Auth** (e.g. `AUTH`/password or token) and **TLS** for the wire protocol.
-- **Max-memory + eviction policy** (LRU/LFU/random) so the server is bounded under memory pressure.
-- **Connection limits / backpressure / per-request quotas** to survive abusive clients.
-- **Config file / CLI flags** (currently port and paths are hard-coded to `:1234`, `redis.dat`, `redis.wal`).
-- **Graceful shutdown & signal handling** — flush WAL, checkpoint, close connections on `SIGTERM`.
-- **Structured logging** with levels, and **metrics export** (Prometheus/OpenMetrics scrape endpoint building on the existing `INFO` counters).
+### 3. Security & operability — **mostly implemented**
+See [Configuration & Operability](#configuration--operability). Done: **auth** (`--requirepass` + `AUTH`), **max-memory LRU eviction** (`--maxmemory`), **connection limits** (`--maxclients`), **CLI/env config** (port, data-dir, etc.), **graceful shutdown** (`SIGTERM`→flush+checkpoint), **structured logging** (levels), **Prometheus `/metrics`** export, and **tombstone GC**. **TLS** is terminated via an stunnel sidecar ([`deploy/stunnel.conf`](deploy/stunnel.conf)); *in-process OpenSSL TLS* (non-blocking handshake in the event loop) remains the one open item here.
 
 ### 4. Stronger isolation & full MVCC coverage
 - **Serializable isolation (SSI)** — current level is [snapshot isolation](#per-type-guarantees-honest-scope), which permits write-skew. SSI needs read-set tracking / predicate validation at commit.
 - **Versioned sorted sets** — `ZADD`/`ZREM` are transactional for *atomicity* but not snapshot-isolated for reads, because the AVL structure isn't versioned. True SI for zsets means MVCC per member.
 
-### 5. Version & tombstone garbage collection
-Old *versions* are pruned, but a fully-deleted key's tombstone `Entry` lingers in the hash map forever. A background/opportunistic sweep should physically remove entries whose newest version is a tombstone older than the oldest live snapshot, reclaiming that memory.
+### 5. ~~Version & tombstone garbage collection~~ — **implemented**
+Old versions are pruned on write, and a throttled background sweep now physically reclaims fully-deleted tombstone `Entry` objects once no live snapshot can see them (`gc_reaped_tombstones` metric). Remaining refinement: incremental cursor-based sweeping instead of a bounded full scan, for very large keyspaces.
 
 ### 6. Hardening the concurrent-read path
 If reads are ever moved back onto worker threads (offload), version-chain pruning needs epoch-based reclamation or hazard pointers to be safe against concurrent readers (see [#6 above](#6-seqlock-rcu--version-copy-safety)).
@@ -635,8 +676,9 @@ If reads are ever moved back onto worker threads (offload), version-chain prunin
 | Persistence | None | mmap snapshot + WAL replay |
 | Concurrent reads | Blocked by writes | Seqlock RCU — readers run in parallel |
 | Accept bottleneck | One `accept()` per EV_READ | Drain loop — handles burst arrivals |
-| Observability | None | p50/p99/p999 + GPU correlation CSV + `INFO` metrics |
+| Observability | None | p50/p99/p999 + `INFO` + **Prometheus `/metrics`** |
 | Transactions | None | **MVCC snapshot isolation** — `BEGIN`/`COMMIT`/`ROLLBACK`, write-write conflict detection |
+| Operability | None | CLI/env config, **AUTH**, **maxmemory LRU eviction**, connection limits, graceful shutdown, tombstone GC, structured logging, TLS (stunnel) |
 | Commands | SET / GET / DEL / ZADD / etc. | Same + WAL-logged + snapshot-backed |
 
 **Throughput headroom:** At pipeline=64, `kvs` reaches ~836k GET ops/s (and ~396k ops/s under an 80/20 mixed workload) on a single loopback connection on a laptop — median of 7 runs, see [Benchmark Results](#benchmark-results). These are single-connection loopback figures, not networked throughput; they rose 6.4× / 3.4× after the inline-GET and WAL group-commit optimizations. On a server-class machine with real network and many connections, the kqueue/epoll model eliminates the O(N) poll bottleneck and scales across connections rather than relying on deeper pipelining of one connection.

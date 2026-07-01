@@ -95,8 +95,8 @@ def call(sock, *args):
 
 
 # ── server lifecycle ───────────────────────────────────────────────────────
-def start_server(workdir):
-    proc = subprocess.Popen([KVS], cwd=workdir,
+def start_server(workdir, extra=None):
+    proc = subprocess.Popen([KVS] + (extra or []), cwd=workdir,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     deadline = time.time() + 10
     while time.time() < deadline:
@@ -321,6 +321,84 @@ def test_mvcc_durability(workdir):
     stop_server(proc, hard=True)
 
 
+def test_auth(workdir):
+    proc = start_server(workdir, ["--requirepass", "s3cret"])
+    s = socket.create_connection((HOST, PORT))
+    try:
+        r = call(s, "get", "k")
+        check(isinstance(r, tuple) and "NOAUTH" in r[2], "commands blocked before AUTH")
+        r = call(s, "auth", "wrong")
+        check(isinstance(r, tuple), "wrong password rejected")
+        check(call(s, "auth", "s3cret") == "OK", "correct password accepted")
+        check(call(s, "set", "k", "v") is None, "commands work after AUTH")
+        check(call(s, "get", "k") == "v", "authed GET works")
+    finally:
+        s.close()
+        stop_server(proc, hard=True)
+
+
+def test_graceful_shutdown(workdir):
+    # SIGTERM must checkpoint + flush so acked data survives a clean restart.
+    proc = start_server(workdir)
+    s = socket.create_connection((HOST, PORT))
+    for i in range(15):
+        call(s, "set", f"gs{i}", f"v{i}")
+    s.close()
+    stop_server(proc, hard=False)          # SIGTERM (graceful)
+
+    proc = start_server(workdir)
+    s = socket.create_connection((HOST, PORT))
+    survived = sum(1 for i in range(15) if call(s, "get", f"gs{i}") == f"v{i}")
+    check(survived == 15, f"graceful shutdown persists data: {survived}/15")
+    s.close()
+    stop_server(proc, hard=True)
+
+
+def test_maxmemory_eviction(workdir):
+    proc = start_server(workdir, ["--maxmemory", "3000"])
+    s = socket.create_connection((HOST, PORT))
+    try:
+        for i in range(300):
+            call(s, "set", f"e{i:04d}", "x" * 40)   # ~50 B each ≫ 3 KB cap
+        info = parse_info(call(s, "info"))
+        check(info["evicted_keys"] > 0, "keys evicted under maxmemory")
+        check(info["memory_used_bytes"] <= 3000 + 200,
+              f"memory held near the cap (got {info['memory_used_bytes']})")
+        check(info["keyspace_keys"] < 300, "keyspace bounded by eviction")
+    finally:
+        s.close()
+        stop_server(proc, hard=True)
+
+
+def test_metrics_endpoint(workdir):
+    proc = start_server(workdir, ["--metrics-port", str(PORT + 1)])
+    s = socket.create_connection((HOST, PORT))
+    try:
+        call(s, "set", "m", "v")
+        call(s, "get", "m")
+        # Scrape the Prometheus endpoint over HTTP.
+        h = socket.create_connection((HOST, PORT + 1))
+        h.sendall(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+        resp = b""
+        h.settimeout(1.0)
+        try:
+            while True:
+                chunk = h.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
+        except socket.timeout:
+            pass
+        h.close()
+        text = resp.decode(errors="replace")
+        check("200 OK" in text, "metrics endpoint returns HTTP 200")
+        check("kvs_commands_processed" in text, "exposes Prometheus counter")
+        check("# TYPE kvs_writes counter" in text, "emits Prometheus TYPE lines")
+    finally:
+        s.close()
+        stop_server(proc, hard=True)
+
+
 def test_crash_recovery(workdir):
     proc = start_server(workdir)
     s = socket.create_connection((HOST, PORT))
@@ -363,6 +441,10 @@ def main():
         test_mvcc(workdir)
         print("  • test_mvcc_durability")
         test_mvcc_durability(workdir)
+        for t in (test_auth, test_graceful_shutdown, test_maxmemory_eviction,
+                  test_metrics_endpoint):
+            print(f"  • {t.__name__}")
+            t(tempfile.mkdtemp(prefix="kvs_op_"))
         print("  • test_crash_recovery")
         test_crash_recovery(workdir)
     finally:
